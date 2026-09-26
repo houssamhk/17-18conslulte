@@ -1,0 +1,41 @@
+# === Python ===
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+*.egg
+
+# === Virtual Environment ===
+venv/
+.venv/
+env/
+
+# === PyInstaller ===
+*.manifest
+*.spec.bak
+
+# === IDE ===
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# === OS ===
+Thumbs.db
+.DS_Store
+desktop.ini
+
+# === Project Specific ===
+onnx_model/
+onnx_quantized/
+*.onnx
+*.db
+*.db-journal
+logs/
+*.log
+
+# === Model Cache ===
+models_cache/
