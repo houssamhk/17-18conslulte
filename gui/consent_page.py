@@ -5,13 +5,14 @@ from PyQt6.QtCore import Qt, QDate
 from storage.secure_db import SecureDatabase
 from gui.theme import COLORS
 import datetime
+from .dialog_utils import configure_dialog_size
 
 class ConsentDialog(QDialog):
     def __init__(self, db: SecureDatabase, parent=None):
         super().__init__(parent)
         self.db = db
         self.setWindowTitle("إضافة موافقة جديدة (New Consent)")
-        self.setFixedSize(400, 350)
+        configure_dialog_size(self, preferred=(560, 620), minimum=(380, 420))
         
         layout = QVBoxLayout(self)
         

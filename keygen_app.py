@@ -1,7 +1,13 @@
 import sys
 import os
-import jwt
-import sqlite3
+import uuid
+import sqlite3 as plain_sqlite
+import keyring
+from cryptography.fernet import Fernet
+try:
+    from sqlcipher3 import dbapi2 as sqlite
+except ImportError as exc:
+    raise RuntimeError("SQLCipher is required to open the encrypted license database.") from exc
 from datetime import datetime, timedelta
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                              QHBoxLayout, QLabel, QLineEdit, QPushButton, 
@@ -9,14 +15,82 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QSpinBox, QComboBox, QDialog, QFormLayout)
 from PyQt6.QtCore import Qt
 
-# Import the secret key directly from the engine
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-from engine.license_manager import LicenseManager
+from engine.license_signer import generate_license
 
 class LicenseDB:
+    SERVICE_NAME = "AlgPIIEngine_LicenseIssuer"
+    KEY_ACCOUNT = "license_database_key"
+
     def __init__(self, db_path="license_db.sqlite"):
-        self.conn = sqlite3.connect(db_path)
+        self.db_path = os.path.abspath(db_path)
+        self.key = self._load_or_create_key()
+        self.fernet = Fernet(self.key)
+        self._migrate_plain_database()
+        self.conn = sqlite.connect(self.db_path)
+        self.conn.execute(f"PRAGMA key = '{self.key.hex()}'")
+        try:
+            self.conn.execute("SELECT count(*) FROM sqlite_master").fetchone()
+        except sqlite.DatabaseError as exc:
+            self.conn.close()
+            raise RuntimeError("License database key is invalid or the database is corrupt.") from exc
         self._init_db()
+
+    def _load_or_create_key(self):
+        existing = os.path.isfile(self.db_path) and os.path.getsize(self.db_path) > 0
+        is_plain = False
+        if existing:
+            with open(self.db_path, "rb") as db_file:
+                is_plain = db_file.read(16) == b"SQLite format 3\x00"
+        stored = keyring.get_password(self.SERVICE_NAME, self.KEY_ACCOUNT)
+        if stored:
+            return stored.encode("ascii")
+        if existing and not is_plain:
+            raise RuntimeError("Encrypted license database key is missing from Windows Credential Manager.")
+        key = Fernet.generate_key()
+        keyring.set_password(self.SERVICE_NAME, self.KEY_ACCOUNT, key.decode("ascii"))
+        if keyring.get_password(self.SERVICE_NAME, self.KEY_ACCOUNT) != key.decode("ascii"):
+            raise RuntimeError("Could not securely store the license database key.")
+        return key
+
+    def _migrate_plain_database(self):
+        if not os.path.isfile(self.db_path) or os.path.getsize(self.db_path) == 0:
+            return
+        with open(self.db_path, "rb") as db_file:
+            if db_file.read(16) != b"SQLite format 3\x00":
+                return
+        source = plain_sqlite.connect(self.db_path)
+        try:
+            dump = "\n".join(source.iterdump())
+        finally:
+            source.close()
+
+        temp_path = f"{self.db_path}.{uuid.uuid4().hex}.encrypted"
+        encrypted = sqlite.connect(temp_path)
+        try:
+            encrypted.execute(f"PRAGMA key = '{self.key.hex()}'")
+            encrypted.execute("SELECT count(*) FROM sqlite_master").fetchone()
+            encrypted.executescript(dump)
+            encrypted.commit()
+        except Exception:
+            encrypted.close()
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+            raise
+        encrypted.close()
+
+        with open(self.db_path, "rb") as source_file:
+            encrypted_backup = self.fernet.encrypt(source_file.read())
+        backup_path = f"{self.db_path}.legacy-backup.fernet"
+        if os.path.exists(backup_path):
+            backup_path += f".{uuid.uuid4().hex}"
+        with open(backup_path, "xb") as backup_file:
+            backup_file.write(encrypted_backup)
+        try:
+            os.replace(temp_path, self.db_path)
+        except Exception:
+            os.remove(backup_path)
+            raise
         
     def _init_db(self):
         c = self.conn.cursor()
@@ -58,6 +132,11 @@ class LicenseDB:
         c = self.conn.cursor()
         c.execute("SELECT id, company_name, hwid, issue_date, expiry_date, status, license_key FROM clients")
         return c.fetchall()
+
+    def close(self):
+        if self.conn:
+            self.conn.close()
+            self.conn = None
 
 class AddClientDialog(QDialog):
     def __init__(self, parent=None):
@@ -183,14 +262,13 @@ class KeyGenApp(QMainWindow):
         
         if days_dialog.exec():
             days = spin.value()
+            try:
+                token = generate_license(hwid, days)
+            except (OSError, ValueError) as exc:
+                QMessageBox.critical(self, "تعذر إصدار الرخصة", str(exc))
+                return
+
             expiry_date = datetime.utcnow() + timedelta(days=days)
-            payload = {
-                "hwid": hwid.upper(),
-                "exp": expiry_date,
-                "iat": datetime.utcnow(),
-                "product": "Alg-PII Engine Enterprise"
-            }
-            token = jwt.encode(payload, LicenseManager.SECRET_KEY, algorithm="HS256")
             
             self.db.update_license(hwid, token, expiry_date)
             self._load_data()

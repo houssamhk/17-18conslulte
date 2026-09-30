@@ -95,11 +95,11 @@ class StatusIndicator(QWidget):
     def _animate(self):
         if self.state == 'loading':
             if self.pulse_up:
-                self.opacity += 0.05
+                self.opacity = min(1.0, self.opacity + 0.05)
                 if self.opacity >= 1.0:
                     self.pulse_up = False
             else:
-                self.opacity -= 0.05
+                self.opacity = max(0.3, self.opacity - 0.05)
                 if self.opacity <= 0.3:
                     self.pulse_up = True
             self.update()

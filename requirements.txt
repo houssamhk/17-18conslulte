@@ -2,12 +2,10 @@
 # Algerian RegTech PII Compliance Platform
 
 # === GUI Framework ===
-PyQt6>=6.6.0
+PyQt6>=6.10.1,<6.11
 
 # === NLP & AI ===
 transformers>=4.40.0
-optimum[onnxruntime]>=1.19.0
-onnxruntime>=1.17.0
 tokenizers>=0.19.0
 
 # === Text Processing ===
@@ -16,15 +14,22 @@ regex>=2024.4.0
 # === Security & Encryption ===
 cryptography>=42.0.0
 keyring>=25.0.0
+sqlcipher3-wheels>=0.5.7
+croniter>=3.0.0
 
 # === Packaging ===
-pyinstaller>=6.5.0
+pyinstaller>=6.21.0
+pyinstaller-hooks-contrib>=2026.6
 
 # === Document Parsing & Reporting ===
 PyMuPDF>=1.23.0
 python-docx>=1.1.0
 openpyxl>=3.1.2
 reportlab>=4.1.0
+extract-msg>=0.48.0
+pytesseract>=0.3.10
+opencv-python-headless>=4.9.0
+pillow>=10.0.0
 
 # === Arabic Processing ===
 arabic-reshaper>=3.0.0

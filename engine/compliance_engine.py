@@ -188,7 +188,12 @@ class AlgComplianceEngine:
             risk_level=risk_level,
             sensitivity_label=sensitivity_label,
             entity_summary=summary,
-            recommendations=["Anonymize immediately before storage.", "Do not export outside national borders."],
+            recommendations=[
+                "Anonymize before storage or sharing.",
+                "Do not export outside approved jurisdictions without an authorized review.",
+                "Automated findings and legal references are indicative only. Verify the current official texts and applicability with qualified Algerian counsel before making compliance decisions.",
+                "النتائج والإحالات القانونية استرشادية؛ يجب التحقق من النصوص الرسمية السارية وانطباقها بواسطة مختص قانوني جزائري قبل اتخاذ قرار امتثال.",
+            ],
             law_references=law_refs,
             applicable_articles=applicable_articles,
             clusters=cluster_analysis.get('clusters', [])

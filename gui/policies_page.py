@@ -6,13 +6,14 @@ from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
 from PyQt6.QtCore import Qt
 from storage.secure_db import SecureDatabase
 from .theme import COLORS
+from .dialog_utils import configure_dialog_size
 
 
 class PolicyBuilderDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("إنشاء سياسة امتثال (Create Policy)")
-        self.resize(500, 400)
+        configure_dialog_size(self, preferred=(760, 620), minimum=(520, 440))
         
         layout = QVBoxLayout(self)
         

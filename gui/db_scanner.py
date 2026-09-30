@@ -3,12 +3,13 @@ from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel,
 import sqlite3
 import pandas as pd
 import logging
+from .dialog_utils import configure_dialog_size
 
 class DatabaseScanDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("فحص قاعدة بيانات (Database Scanner)")
-        self.setFixedSize(450, 300)
+        configure_dialog_size(self, preferred=(680, 560), minimum=(480, 380))
         
         layout = QVBoxLayout(self)
         

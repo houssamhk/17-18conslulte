@@ -9,7 +9,19 @@ import keyring
 class LicenseManager:
     """Manages Hardware ID generation and JWT License Validation."""
     
-    SECRET_KEY = "ALG_PII_SOVEREIGN_REGTECH_SECRET_KEY_2026"
+    # Public verification key only. The corresponding private signing key is
+    # kept by the license issuer and is never included in the desktop build.
+    PUBLIC_KEY = """-----BEGIN PUBLIC KEY-----
+MIIBojANBgkqhkiG9w0BAQEFAAOCAY8AMIIBigKCAYEAot6Ao7Y3mGP/Kk0yhD6U
+3nLath05ZrMsxT8vv3rzJuh5A+cno8TtTsdmW+xqSmxSN6NoJCSm3nxB5+DTftr0
+rBQEq4Ibyhe/oqETyPS45+a74TLH+Gv11E+F8kNIV/SQKIPKFGf9nryqbWTzizX0
+sqpUvh2P2E41VV6pKpvr7Qfquvn9u9pgKMwa3dtnH8TecpHtxxJEYsf2UoRyFuxh
+eFUV/XK2HOR5cTfyd0XHb01XyCL/LRUB2DPj8vAIGw+cur/yyzXslDlbtINpItbQ
+e7+nLi5wYEkt7D9ptbYTi/B3HKoUgKGdY9tDFzvONCnAFyIipLy2qjUB23XG0PXq
+NZwVB4ZXEVksXi3rYshVa91hykAA9FVO4Z5Sck4UBJnzlQ8HHn3F03yNFiW3s5MO
+hyR9QQg1KjtEF82EY9xv11EZDO9PoAwheZpTdxgHOTnjmDBGkJaJPtUSqm90U5nY
+muENOdXkTYXSSbxXE9F9r8lqVwSb5t3NswUtXl9mqjehAgMBAAE=
+-----END PUBLIC KEY-----"""
     SERVICE_NAME = "AlgPIIEngine_License"
     KEY_ACCOUNT = "license_token"
 
@@ -26,10 +38,12 @@ class LicenseManager:
         """Validates a JWT license token against the machine's HWID."""
         try:
             hwid = LicenseManager.get_hardware_id()
-            decoded = jwt.decode(token, LicenseManager.SECRET_KEY, algorithms=["HS256"])
+            decoded = jwt.decode(token, LicenseManager.PUBLIC_KEY, algorithms=["RS256"])
             
             if decoded.get("hwid") != hwid:
                 return False, "رقم الجهاز غير متطابق (Hardware ID mismatch)."
+            if decoded.get("product") != "Alg-PII Engine Enterprise":
+                return False, "الرخصة لا تخص هذا المنتج (License product mismatch)."
                 
             return True, "الرخصة صالحة (License Valid)."
         except jwt.ExpiredSignatureError:

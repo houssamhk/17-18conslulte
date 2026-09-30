@@ -4,7 +4,7 @@ import logging
 
 class NLPDetector:
     """
-    Contextual NLP Detection Layer — ONNX-optimized Transformer NER.
+    Contextual NLP Detection Layer — local Transformer NER.
     Uses CAMeL-Lab/bert-base-arabic-camelbert-msa-ner for Arabic NER.
     """
     def __init__(self, model_path: Optional[str] = None):
@@ -13,7 +13,7 @@ class NLPDetector:
         self._is_available = False
         
     def load_model(self, model_path: Optional[str] = None) -> bool:
-        """Lazy loads the NER model. Tries ONNX runtime first, falls back to standard transformers."""
+        """Load local PyTorch weights without downloading or converting to ONNX."""
         if self._pipeline is not None:
             return True
             
@@ -21,39 +21,22 @@ class NLPDetector:
             self.model_path = model_path
 
         try:
-            from transformers import pipeline, AutoTokenizer
-            try:
-                from optimum.onnxruntime import ORTModelForTokenClassification
-                
-                # Attempt ONNX load
-                tokenizer = AutoTokenizer.from_pretrained(self.model_path)
-                # Ensure export=True if loading from Hub and not already ONNX, but in production this should point to a local ONNX model
-                try:
-                    model = ORTModelForTokenClassification.from_pretrained(self.model_path)
-                except Exception:
-                    # Fallback if export is needed (development only)
-                    model = ORTModelForTokenClassification.from_pretrained(self.model_path, export=True)
-                    
-                self._pipeline = pipeline(
-                    "token-classification",
-                    model=model,
-                    tokenizer=tokenizer,
-                    aggregation_strategy="simple"
+            from transformers import pipeline, AutoModelForTokenClassification, AutoTokenizer
+            tokenizer = AutoTokenizer.from_pretrained(self.model_path, local_files_only=True)
+            model = AutoModelForTokenClassification.from_pretrained(
+                self.model_path, local_files_only=True
+            )
+            if tokenizer.model_max_length > 100000:
+                tokenizer.model_max_length = int(
+                    getattr(model.config, "max_position_embeddings", 512)
                 )
-                logging.info(f"Loaded ONNX NER model from {self.model_path}")
-                self._is_available = True
-                return True
-                
-            except ImportError:
-                logging.warning("optimum[onnxruntime] not installed. Falling back to standard transformers.")
-                
-            # Fallback to standard transformers
             self._pipeline = pipeline(
                 "token-classification",
-                model=self.model_path,
+                model=model,
+                tokenizer=tokenizer,
                 aggregation_strategy="simple"
             )
-            logging.info(f"Loaded standard PyTorch NER model from {self.model_path}")
+            logging.info("Loaded local NER model from %s", self.model_path)
             self._is_available = True
             return True
             
@@ -75,6 +58,8 @@ class NLPDetector:
             return []
             
         try:
+            # This transformers release does not expose tokenizer truncation
+            # through TokenClassificationPipeline.__call__.
             results = self._pipeline(text)
             entities = []
             

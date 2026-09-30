@@ -1,9 +1,15 @@
+import os
 import sys
+import logging
+from dataclasses import replace
 from PyQt6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
                              QSplitter, QTextEdit, QLabel, QStatusBar, QMenuBar, 
                              QFileDialog, QMessageBox, QApplication, QProgressDialog,
                              QStackedWidget, QPushButton, QFrame, QDialog)
-from PyQt6.QtCore import Qt, QTimer, QSize
+from PyQt6.QtWidgets import QScrollArea
+from PyQt6.QtWidgets import QSystemTrayIcon
+from PyQt6.QtCore import Qt, QTimer, QSize, QPropertyAnimation, QEasingCurve, QEvent, QObject
+from PyQt6.QtWidgets import QGraphicsOpacityEffect
 from PyQt6.QtGui import QAction, QIcon
 import qtawesome as qta
 
@@ -11,19 +17,20 @@ from engine.compliance_engine import AlgComplianceEngine
 from engine.regex_detector import AnonymizedResult
 from engine.document_parser import DocumentParser
 from engine.pdf_exporter import PDFExporter
-from engine.redaction_verifier import RedactionVerifier
 from engine.fingerprint import FingerprintEngine
 from engine.policy_engine import PolicyEngine
 from engine.scheduler import TaskScheduler
+from engine.cross_linker import CrossLinker
 from storage.secure_db import SecureDatabase
 from .widgets import AnimatedButton, EntityBadge, StatusIndicator, DropZone, ComplianceGauge
-from .scan_thread import ScanWorker
+from .scan_thread import NLPModelLoadWorker, ScanWorker, VerificationWorker
 from .batch_worker import BatchWorker
 from .settings_dialog import SettingsDialog
 from .theme import COLORS
 from engine.license_manager import LicenseManager
 from .license_dialog import LicenseDialog
-from .login_dialog import LoginDialog
+from .login_dialog import FirstRunAdminDialog, LoginDialog, PasswordChangeDialog, SessionLockDialog
+from .totp_dialog import TotpManagementDialog, TotpRecoveryDialog
 from .dashboard import DashboardWidget
 from .policies_page import PoliciesPageWidget
 from .incidents_page import IncidentsPageWidget
@@ -61,15 +68,66 @@ class SidebarButton(QPushButton):
         self.setCheckable(True)
         # Handle RTL icon alignment if needed (Qtawesome supports RTL automatically usually)
 
+
+class SessionActivityMonitor(QObject):
+    """Reset a single-shot lock timer on keyboard and pointer activity."""
+
+    ACTIVITY_EVENTS = {
+        QEvent.Type.MouseMove,
+        QEvent.Type.MouseButtonPress,
+        QEvent.Type.MouseButtonRelease,
+        QEvent.Type.KeyPress,
+        QEvent.Type.Wheel,
+        QEvent.Type.TouchBegin,
+        QEvent.Type.TouchUpdate,
+        QEvent.Type.TabletPress,
+    }
+
+    def __init__(self, window, timeout_minutes):
+        super().__init__(QApplication.instance())
+        self.window = window
+        self.timer = QTimer(self)
+        self.timer.setSingleShot(True)
+        self.timer.timeout.connect(window.lock_session)
+        QApplication.instance().installEventFilter(self)
+        self.set_timeout(timeout_minutes)
+
+    def set_timeout(self, timeout_minutes):
+        self.timeout_ms = max(0, int(timeout_minutes)) * 60 * 1000
+        if self.timeout_ms:
+            self.timer.start(self.timeout_ms)
+        else:
+            self.timer.stop()
+
+    def pause(self):
+        self.timer.stop()
+
+    def resume(self):
+        if self.timeout_ms:
+            self.timer.start(self.timeout_ms)
+
+    def eventFilter(self, watched, event):
+        if (self.timeout_ms and not self.window._session_locked
+                and event.type() in self.ACTIVITY_EVENTS):
+            self.timer.start(self.timeout_ms)
+        return False
+
 class AlgPIIMainWindow(QMainWindow):
     def __init__(self, db: SecureDatabase):
         super().__init__()
         self.db = db
+        self._verification_passed = False
+        self._verification_target = None
         
         # 1. License Check
         if not LicenseManager.is_activated():
             dlg = LicenseDialog(self)
             if dlg.exec() != QDialog.DialogCode.Accepted:
+                sys.exit(0)
+
+        if not self.db.has_users():
+            setup_dlg = FirstRunAdminDialog(self.db, self)
+            if setup_dlg.exec() != QDialog.DialogCode.Accepted:
                 sys.exit(0)
                 
         # 2. User Authentication
@@ -85,13 +143,16 @@ class AlgPIIMainWindow(QMainWindow):
         self.db.log_audit(self.username, "LOGIN", f"User logged into the system{dept_str}.")
         
         # 3. Load Settings & Keywords
-        self.nlp_enabled = self.db.get_setting("nlp_enabled", True)
+        self.nlp_enabled = self.db.get_setting("nlp_enabled", False)
         self.model_path = self.db.get_setting("model_path", None)
         self.strategy = self.db.get_setting("anonymization_strategy", "legal_mask")
         self.custom_keywords = self.db.get_custom_keywords()
+        self.ocr_enabled = self.db.get_setting("ocr_enabled", True)
+        self.ocr_language = self.db.get_setting("ocr_language", "ara+eng")
+        self.tesseract_cmd = self.db.get_setting("tesseract_cmd", "")
+        DocumentParser.configure_ocr(self.ocr_enabled, self.ocr_language, self.tesseract_cmd)
         
         self.setWindowTitle("محرك الامتثال الجزائري | Alg-PII Engine")
-        self.resize(1200, 800)
         
         self.labeling_policies = self.db.get_labeling_policies()
         self.regulatory_mappings = self.db.get_regulatory_mappings()
@@ -109,23 +170,122 @@ class AlgPIIMainWindow(QMainWindow):
         
         from engine.anomaly_detector import AnomalyDetector
         self.anomaly_detector = AnomalyDetector(self.db)
+
+        # Build the scheduler before the page stack because the scheduled-task
+        # page receives it during construction. Start it only after the UI is ready.
+        self.scheduler = TaskScheduler(self.db, self.engine, self)
         
         self.worker = None
         
         self._init_ui()
+        # Apply the window bounds after building pages; otherwise large
+        # size hints from hidden admin pages can force it beyond screen height.
+        self.setMinimumSize(900, 600)
+        self.resize(1440, 900)
         self._init_shortcuts()
         self._check_engine_status()
         
-        # Start Scheduler Background Daemon
-        self.scheduler = TaskScheduler(self.db, self.engine, self)
+        # Start Scheduler Background Daemon after status widgets exist.
         self.scheduler.task_started.connect(lambda n: self.status_lbl.setText(f"تشغيل المهمة المجدولة (Running task): {n}"))
-        self.scheduler.task_finished.connect(lambda n, f, v: self.status_lbl.setText(f"اكتملت المهمة (Task done): {n} ({f} ملفات، {v} انتهاكات)"))
+        self.scheduler.task_finished.connect(
+            lambda n, f, v, errors: self.status_lbl.setText(
+                f"اكتملت المهمة: {n} ({f} ملفات، {v} انتهاكات، {errors} إخفاقات)"
+            )
+        )
         self.scheduler.start()
         
         self._init_tray()
+        self._session_locked = False
+        self.session_activity_monitor = SessionActivityMonitor(
+            self, self.db.get_setting("session_idle_minutes", 15)
+        )
+        self._audit_integrity_alerted = False
+        self.audit_integrity_timer = QTimer(self)
+        self.audit_integrity_timer.setInterval(5 * 60 * 1000)
+        self.audit_integrity_timer.timeout.connect(self._check_audit_integrity)
+        self.audit_integrity_timer.start()
+        QTimer.singleShot(1200, self._check_audit_integrity)
+
+    def _check_audit_integrity(self):
+        """Check the tamper-evident audit chain without writing to it."""
+        try:
+            result = self.db.verify_audit_integrity()
+        except Exception:
+            logging.exception("Could not verify audit log integrity")
+            result = {"valid": False, "reason": "verification_error", "entry_id": None}
+
+        if result.get("valid"):
+            if result.get("truncated_prefix"):
+                self.audit_integrity_lbl.setText("التدقيق: سلسلة مقتطعة")
+                self.audit_integrity_lbl.setToolTip("السجلات المتاحة سليمة، لكن سياسة الاحتفاظ أزالت بداية السلسلة.")
+                self.audit_integrity_lbl.setStyleSheet(f"color: {COLORS['WARNING']};")
+            else:
+                self.audit_integrity_lbl.setText("التدقيق: سليم")
+                self.audit_integrity_lbl.setToolTip("اجتازت سلسلة سجل التدقيق فحص HMAC والمرساة المحمية.")
+                self.audit_integrity_lbl.setStyleSheet(f"color: {COLORS['SUCCESS']};")
+            self._audit_integrity_alerted = False
+            return
+
+        reason = result.get("reason", "verification_error")
+        self.audit_integrity_lbl.setText("تحذير: تعذر التحقق من سجل التدقيق")
+        self.audit_integrity_lbl.setToolTip(f"سبب الفشل: {reason}; السجل: {result.get('entry_id')}")
+        self.audit_integrity_lbl.setStyleSheet(f"color: {COLORS['ERROR']}; font-weight: bold;")
+        if not self._audit_integrity_alerted:
+            self._audit_integrity_alerted = True
+            QMessageBox.critical(
+                self,
+                "تحذير سلامة سجل التدقيق",
+                "فشل فحص سلامة سجل التدقيق. قد تكون سجلات قد عُدّلت أو حُذفت، أو تعذر الوصول إلى المرساة المحمية. لا تعتمد على السجل حتى يراجعه مسؤول النظام.",
+            )
+
+    def _show_account_menu(self):
+        from PyQt6.QtWidgets import QMenu
+        menu = QMenu(self)
+        change_password = menu.addAction("تغيير كلمة المرور")
+        totp_enabled = self.db.user_totp_enabled(self.username)
+        manage_totp = menu.addAction("تعطيل المصادقة الثنائية" if totp_enabled else "إعداد المصادقة الثنائية")
+        recovery_codes = None
+        if totp_enabled:
+            remaining = self.db.get_totp_recovery_count(self.username)
+            recovery_codes = menu.addAction(f"تجديد أكواد الاسترداد ({remaining} متبقية)")
+        lock_session = menu.addAction("قفل الجلسة")
+        selected = menu.exec(self.cursor().pos())
+        if selected == change_password:
+            dialog = PasswordChangeDialog(self.db, self.username, self)
+            if dialog.exec() == QDialog.DialogCode.Accepted:
+                self.status_lbl.setText("تم تحديث كلمة مرور الحساب")
+        elif selected == lock_session:
+            self.lock_session()
+        elif selected == manage_totp:
+            dialog = TotpManagementDialog(self.db, self.username, totp_enabled, self)
+            dialog.exec()
+        elif selected == recovery_codes:
+            dialog = TotpRecoveryDialog(self.db, self.username, self)
+            dialog.exec()
+
+    def lock_session(self):
+        """Hide sensitive application content until the current user reauthenticates."""
+        if self._session_locked:
+            return
+        self._session_locked = True
+        self.session_activity_monitor.pause()
+        self.db.log_audit(self.username, "SESSION_LOCK", "User locked their application session.")
+        self.hide()
+        dialog = SessionLockDialog(self.db, self.username)
+        unlocked = dialog.exec() == QDialog.DialogCode.Accepted
+        if not unlocked:
+            self.force_quit()
+            return
+        self._session_locked = False
+        self.session_activity_monitor.resume()
+        self.db.log_audit(self.username, "SESSION_UNLOCK", "User unlocked their application session.")
+        self.show()
+        self.raise_()
+        self.activateWindow()
+        self.status_lbl.setText("تم إلغاء قفل الجلسة")
 
     def _init_tray(self):
-        from PyQt6.QtWidgets import QSystemTrayIcon, QMenu
+        from PyQt6.QtWidgets import QMenu
         self.tray = QSystemTrayIcon(self)
         self.tray.setIcon(qta.icon('fa5s.shield-alt', color=COLORS['ACCENT']))
         
@@ -146,8 +306,12 @@ class AlgPIIMainWindow(QMainWindow):
         self.tray.showMessage("Alg-PII Engine", "التطبيق يعمل في الخلفية.\nThe application is running in the background.", QSystemTrayIcon.MessageIcon.Information, 2000)
 
     def force_quit(self):
+        if getattr(self, "nlp_worker", None) and self.nlp_worker.isRunning():
+            self.nlp_worker.wait()
         self.scheduler.stop()
         self.scheduler.wait()
+        self.tray.hide()
+        self.db.close()
         from PyQt6.QtWidgets import QApplication
         QApplication.instance().quit()
 
@@ -178,6 +342,7 @@ class AlgPIIMainWindow(QMainWindow):
         
         # Ctrl+Q — Quit
         QShortcut(QKeySequence("Ctrl+Q"), self, activated=self.force_quit)
+        QShortcut(QKeySequence("Ctrl+Alt+L"), self, activated=self.lock_session)
         
         # Ctrl+, — Settings
         QShortcut(QKeySequence("Ctrl+,"), self, activated=self.on_settings)
@@ -198,10 +363,11 @@ class AlgPIIMainWindow(QMainWindow):
         
         # --- SIDEBAR ---
         self.sidebar = QFrame()
-        self.sidebar.setFixedWidth(250)
+        self.sidebar.setFixedWidth(268)
         self.sidebar.setStyleSheet(f"background-color: {COLORS['BG_MAIN']}; border-right: 1px solid {COLORS['BG_PANEL']};")
         sidebar_layout = QVBoxLayout(self.sidebar)
-        sidebar_layout.setContentsMargins(10, 20, 10, 20)
+        sidebar_layout.setContentsMargins(12, 24, 12, 20)
+        sidebar_layout.setSpacing(6)
         
         # Logo/Brand
         brand_lbl = QLabel("Alg-PII Engine")
@@ -209,12 +375,22 @@ class AlgPIIMainWindow(QMainWindow):
         brand_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         sidebar_layout.addWidget(brand_lbl)
         
-        user_lbl = QLabel(f"مرحباً، {self.username}\n({self.user_role})")
-        user_lbl.setStyleSheet(f"color: {COLORS['TEXT_SECONDARY']}; border: none;")
-        user_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        user_lbl = QPushButton(f"مرحباً، {self.username}\n({self.user_role})  ·  الحساب")
+        user_lbl.setStyleSheet(f"color: {COLORS['TEXT_SECONDARY']}; border: none; background: transparent; padding: 8px 4px;")
+        user_lbl.setToolTip("إدارة كلمة مرور الحساب")
+        user_lbl.clicked.connect(self._show_account_menu)
         sidebar_layout.addWidget(user_lbl)
         
         sidebar_layout.addSpacing(30)
+
+        nav_scroll = QScrollArea()
+        nav_scroll.setWidgetResizable(True)
+        nav_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        nav_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        nav_content = QWidget()
+        navigation_layout = QVBoxLayout(nav_content)
+        navigation_layout.setContentsMargins(0, 0, 0, 0)
+        navigation_layout.setSpacing(6)
         
         # Sidebar Buttons
         self.nav_btns = []
@@ -222,69 +398,102 @@ class AlgPIIMainWindow(QMainWindow):
         self.btn_nav_scan = SidebarButton('fa5s.search', "الماسح الضوئي (Scanner)")
         self.btn_nav_scan.setChecked(True)
         self.btn_nav_scan.clicked.connect(lambda: self._switch_page(0))
-        sidebar_layout.addWidget(self.btn_nav_scan)
+        navigation_layout.addWidget(self.btn_nav_scan)
         self.nav_btns.append(self.btn_nav_scan)
+
+        if self.user_role != "admin":
+            self.btn_nav_dash = SidebarButton('fa5s.chart-pie', "لوحة القسم (Department Dashboard)")
+            self.btn_nav_dash.clicked.connect(lambda: self._switch_page(1))
+            navigation_layout.addWidget(self.btn_nav_dash)
+            self.nav_btns.append(self.btn_nav_dash)
         
         # Admin Only Buttons
         if self.user_role == "admin":
             self.btn_nav_dash = SidebarButton('fa5s.chart-pie', "لوحة الإحصائيات (Dashboard)")
             self.btn_nav_dash.clicked.connect(lambda: self._switch_page(1))
-            sidebar_layout.addWidget(self.btn_nav_dash)
+            navigation_layout.addWidget(self.btn_nav_dash)
             self.nav_btns.append(self.btn_nav_dash)
             
             self.btn_nav_policies = SidebarButton('fa5s.shield-alt', "السياسات (Policies)")
             self.btn_nav_policies.clicked.connect(lambda: self._switch_page(2))
-            sidebar_layout.addWidget(self.btn_nav_policies)
+            navigation_layout.addWidget(self.btn_nav_policies)
             self.nav_btns.append(self.btn_nav_policies)
             
             self.btn_nav_incidents = SidebarButton('fa5s.exclamation-triangle', "الحوادث (Incidents)")
             self.btn_nav_incidents.clicked.connect(lambda: self._switch_page(3))
-            sidebar_layout.addWidget(self.btn_nav_incidents)
+            navigation_layout.addWidget(self.btn_nav_incidents)
             self.nav_btns.append(self.btn_nav_incidents)
             
             self.btn_nav_scheduled = SidebarButton('fa5s.clock', "المهام المجدولة (Scheduled Tasks)")
             self.btn_nav_scheduled.clicked.connect(lambda: self._switch_page(4))
-            sidebar_layout.addWidget(self.btn_nav_scheduled)
+            navigation_layout.addWidget(self.btn_nav_scheduled)
             self.nav_btns.append(self.btn_nav_scheduled)
             
             self.btn_nav_network = SidebarButton('fa5s.project-diagram', "شبكة الكيانات (Entity Network)")
             self.btn_nav_network.clicked.connect(lambda: self._switch_page(5))
-            sidebar_layout.addWidget(self.btn_nav_network)
+            navigation_layout.addWidget(self.btn_nav_network)
             self.nav_btns.append(self.btn_nav_network)
             
             self.btn_nav_dsar = SidebarButton('fa5s.user-shield', "طلبات الأفراد (DSAR)")
             self.btn_nav_dsar.clicked.connect(lambda: self._switch_page(6))
-            sidebar_layout.addWidget(self.btn_nav_dsar)
+            navigation_layout.addWidget(self.btn_nav_dsar)
             self.nav_btns.append(self.btn_nav_dsar)
             
             self.btn_nav_pia = SidebarButton('fa5s.clipboard-check', "التقييمات (PIA)")
             self.btn_nav_pia.clicked.connect(lambda: self._switch_page(7))
-            sidebar_layout.addWidget(self.btn_nav_pia)
+            navigation_layout.addWidget(self.btn_nav_pia)
             self.nav_btns.append(self.btn_nav_pia)
             
             self.btn_nav_consent = SidebarButton('fa5s.handshake', "الموافقات (Consents)")
             self.btn_nav_consent.clicked.connect(lambda: self._switch_page(8))
-            sidebar_layout.addWidget(self.btn_nav_consent)
+            navigation_layout.addWidget(self.btn_nav_consent)
             self.nav_btns.append(self.btn_nav_consent)
             
             self.btn_nav_vault = SidebarButton('fa5s.lock', "القبو الآمن (Vault)")
             self.btn_nav_vault.clicked.connect(lambda: self._switch_page(9))
-            sidebar_layout.addWidget(self.btn_nav_vault)
+            navigation_layout.addWidget(self.btn_nav_vault)
             self.nav_btns.append(self.btn_nav_vault)
+
+            self.btn_nav_transfers = SidebarButton('fa5s.exchange-alt', "النقل الآمن (Transfers)")
+            self.btn_nav_transfers.clicked.connect(lambda: self._switch_page(10))
+            navigation_layout.addWidget(self.btn_nav_transfers)
+            self.nav_btns.append(self.btn_nav_transfers)
+
+            self.btn_nav_data_flow = SidebarButton('fa5s.project-diagram', "تدفق البيانات (Data Flow)")
+            self.btn_nav_data_flow.clicked.connect(lambda: self._switch_page(11))
+            navigation_layout.addWidget(self.btn_nav_data_flow)
+            self.nav_btns.append(self.btn_nav_data_flow)
+
+            self.btn_nav_calendar = SidebarButton('fa5s.calendar-alt', "تقويم الامتثال (Calendar)")
+            self.btn_nav_calendar.clicked.connect(lambda: self._switch_page(12))
+            navigation_layout.addWidget(self.btn_nav_calendar)
+            self.nav_btns.append(self.btn_nav_calendar)
+
+            self.btn_nav_training = SidebarButton('fa5s.graduation-cap', "التدريب (Training)")
+            self.btn_nav_training.clicked.connect(lambda: self._switch_page(13))
+            navigation_layout.addWidget(self.btn_nav_training)
+            self.nav_btns.append(self.btn_nav_training)
+
+            self.btn_nav_report_templates = SidebarButton('fa5s.file-alt', "قوالب التقارير (Report Templates)")
+            self.btn_nav_report_templates.clicked.connect(lambda: self._switch_page(14))
+            navigation_layout.addWidget(self.btn_nav_report_templates)
+            self.nav_btns.append(self.btn_nav_report_templates)
             
             self.btn_nav_settings = SidebarButton('fa5s.cog', "الإعدادات (Settings)")
             self.btn_nav_settings.clicked.connect(self.on_settings)
-            sidebar_layout.addWidget(self.btn_nav_settings)
+            navigation_layout.addWidget(self.btn_nav_settings)
             self.nav_btns.append(self.btn_nav_settings)
             
-        sidebar_layout.addStretch()
+        navigation_layout.addStretch()
+        nav_scroll.setWidget(nav_content)
+        sidebar_layout.addWidget(nav_scroll, stretch=1)
         
         self.btn_nav_about = SidebarButton('fa5s.info-circle', "حول البرنامج (About)")
         self.btn_nav_about.clicked.connect(self.on_about)
         sidebar_layout.addWidget(self.btn_nav_about)
         
-        self.btn_nav_logout = SidebarButton('fa5s.sign-out-alt', "تسجيل خروج (Logout)")
-        self.btn_nav_logout.clicked.connect(self.close)
+        self.btn_nav_logout = SidebarButton('fa5s.sign-out-alt', "إنهاء آمن (Quit)")
+        self.btn_nav_logout.clicked.connect(self.force_quit)
         sidebar_layout.addWidget(self.btn_nav_logout)
         
         main_layout.addWidget(self.sidebar)
@@ -296,11 +505,11 @@ class AlgPIIMainWindow(QMainWindow):
         self.scanner_page = self._create_scanner_page()
         self.content_stack.addWidget(self.scanner_page)
         
-        # Page 1: Dashboard (Only created if admin)
+        # Page 1: Dashboard; standard users receive department-scoped data.
+        self.dashboard_page = DashboardWidget(self.db, self.user_role, self.user_department)
+        self.content_stack.addWidget(self.dashboard_page)
+
         if self.user_role == "admin":
-            self.dashboard_page = DashboardWidget(self.db, self.user_role, self.user_department)
-            self.content_stack.addWidget(self.dashboard_page)
-            
             # Page 2: Policies
             self.policies_page = PoliciesPageWidget(self.db)
             self.content_stack.addWidget(self.policies_page)
@@ -310,7 +519,9 @@ class AlgPIIMainWindow(QMainWindow):
             self.content_stack.addWidget(self.incidents_page)
             
             # Page 4: Scheduled Tasks
-            self.scheduled_page = ScheduledTasksPageWidget(self.db)
+            self.scheduled_page = ScheduledTasksPageWidget(
+                self.db, self.username, scheduler=self.scheduler
+            )
             self.content_stack.addWidget(self.scheduled_page)
             
             # Page 5: Entity Network
@@ -337,6 +548,24 @@ class AlgPIIMainWindow(QMainWindow):
             from gui.vault_page import VaultPageWidget
             self.vault_page = VaultPageWidget(self.db, self.user_department, self.username)
             self.content_stack.addWidget(self.vault_page)
+
+            # These pages contain organization-wide transfer and flow records.
+            # Keep them in the administrator-only page stack.
+            self.transfer_page = TransferPageWidget(self.db, None, self.username)
+            self.content_stack.addWidget(self.transfer_page)
+
+            self.data_flow_page = DataFlowPageWidget(self.db)
+            self.content_stack.addWidget(self.data_flow_page)
+
+            # These admin pages were implemented but not reachable from navigation.
+            self.calendar_page = CalendarPageWidget(self.db)
+            self.content_stack.addWidget(self.calendar_page)
+
+            self.training_page = TrainingPageWidget(self.db, self.username)
+            self.content_stack.addWidget(self.training_page)
+
+            self.report_template_page = ReportTemplatePageWidget(self.db)
+            self.content_stack.addWidget(self.report_template_page)
             
         main_layout.addWidget(self.content_stack, stretch=1)
         
@@ -348,10 +577,44 @@ class AlgPIIMainWindow(QMainWindow):
         self.status_bar.addPermanentWidget(self.status_ind)
         self.status_lbl = QLabel("جاهز (Ready)")
         self.status_bar.addPermanentWidget(self.status_lbl)
+        self.engine_capability_lbl = QLabel("الكشف: قواعد محلية | OCR: حسب التثبيت")
+        self.engine_capability_lbl.setStyleSheet(f"color: {COLORS['TEXT_SECONDARY']};")
+        self.status_bar.addPermanentWidget(self.engine_capability_lbl)
+        self.audit_integrity_lbl = QLabel("التدقيق: جارٍ الفحص")
+        self.audit_integrity_lbl.setToolTip("يُفحص سجل التدقيق تلقائيًا عند بدء التشغيل وكل خمس دقائق.")
+        self.status_bar.addPermanentWidget(self.audit_integrity_lbl)
         
     def _create_scanner_page(self) -> QWidget:
         page = QWidget()
         layout = QVBoxLayout(page)
+
+        # A small first-run guide makes the scanner usable without requiring
+        # users to find their own sensitive documents just to try the app.
+        intro = QFrame()
+        intro.setObjectName("scannerIntro")
+        intro.setStyleSheet(f"""
+            QFrame#scannerIntro {{
+                background-color: {COLORS['BG_PANEL']};
+                border: 1px solid {COLORS['ACCENT_PURPLE']};
+                border-radius: 12px;
+            }}
+            QFrame#scannerIntro QLabel {{ border: none; background: transparent; }}
+        """)
+        intro_layout = QHBoxLayout(intro)
+        intro_layout.setContentsMargins(18, 12, 18, 12)
+        intro_copy = QVBoxLayout()
+        intro_title = QLabel("ابدأ بفحص بيانات تجريبية")
+        intro_title.setStyleSheet(f"color: {COLORS['ACCENT']}; font-size: 16px; font-weight: bold;")
+        intro_hint = QLabel("جرّب ملفًا اصطناعيًا، راجع النص، ثم افحصه. راجع التصنيف والتظليل واستخدم «تحقق». صيغ التصدير تتضمن النص المعالج وملخصًا دون القيم الأصلية المكتشفة.")
+        intro_hint.setWordWrap(True)
+        intro_hint.setStyleSheet(f"color: {COLORS['TEXT_SECONDARY']};")
+        intro_copy.addWidget(intro_title)
+        intro_copy.addWidget(intro_hint)
+        intro_layout.addLayout(intro_copy, stretch=1)
+        self.btn_demo_sample = AnimatedButton("تجربة عينة آمنة")
+        self.btn_demo_sample.clicked.connect(self.load_demo_sample)
+        intro_layout.addWidget(self.btn_demo_sample)
+        layout.addWidget(intro)
         
         self.splitter = QSplitter(Qt.Orientation.Horizontal)
         
@@ -403,6 +666,11 @@ class AlgPIIMainWindow(QMainWindow):
         output_header = QLabel("النتائج المُعالجة (Processed Results)")
         output_header.setStyleSheet(f"color: {COLORS['ACCENT']}; font-weight: bold; font-size: 14px;")
         output_layout.addWidget(output_header)
+
+        self.results_hint = QLabel("بعد الفحص: راجع التظليل والشارات واضغط «تحقق». كل صيغ التصدير تتضمن النص المعالج وملخص النتائج دون القيم الأصلية المكتشفة.")
+        self.results_hint.setWordWrap(True)
+        self.results_hint.setStyleSheet(f"color: {COLORS['TEXT_SECONDARY']}; padding: 4px;")
+        output_layout.addWidget(self.results_hint)
         
         self.badges_layout = QHBoxLayout()
         self.badges_layout.setAlignment(Qt.AlignmentFlag.AlignLeft)
@@ -414,16 +682,22 @@ class AlgPIIMainWindow(QMainWindow):
         
         self.btn_copy = AnimatedButton("نسخ (Copy)")
         self.btn_copy.clicked.connect(self.on_copy)
+        self.btn_copy.setEnabled(False)
         self.btn_export = AnimatedButton("تصدير (Export)", primary=True)
         self.btn_export.clicked.connect(self.on_export)
+        self.btn_export.setEnabled(False)
         self.btn_verify = AnimatedButton("تحقق (Verify)")
         self.btn_verify.clicked.connect(self.on_verify)
+        self.btn_review = AnimatedButton("مراجعة الكيانات")
+        self.btn_review.setEnabled(False)
+        self.btn_review.clicked.connect(self.on_review_entities)
         
         # Init sync scrolling state
         self._toggle_sync_scroll()
         
         out_btn_layout = QHBoxLayout()
         out_btn_layout.addStretch()
+        out_btn_layout.addWidget(self.btn_review)
         out_btn_layout.addWidget(self.btn_verify)
         out_btn_layout.addWidget(self.btn_copy)
         out_btn_layout.addWidget(self.btn_export)
@@ -436,38 +710,134 @@ class AlgPIIMainWindow(QMainWindow):
         layout.addWidget(self.splitter)
         return page
 
+    def load_demo_sample(self):
+        """Generate and load an explicitly synthetic sample in a supported format."""
+        from PyQt6.QtWidgets import QInputDialog
+        formats = ["TXT - نص", "CSV - جدول", "PDF - مستند", "DOCX - مستند Word", "XLSX - جدول Excel"]
+        selected, accepted = QInputDialog.getItem(
+            self, "عينة تدريبية آمنة", "اختر صيغة الملف:", formats, 0, False
+        )
+        if not accepted:
+            return
+
+        import csv
+        import os
+        import tempfile
+        sample_dir = os.path.join(tempfile.gettempdir(), "AlgPIIEngine-DemoSamples")
+        os.makedirs(sample_dir, exist_ok=True)
+        stem = "synthetic_pii_demo"
+        rows = [
+            ("الحقل", "القيمة التجريبية"),
+            ("الاسم", "أحمد بن سالم (اسم افتراضي)"),
+            ("البريد", "demo.person@example.com"),
+            ("الهاتف", "0551234567"),
+            ("رقم تعريف تجريبي", "123456789012345678"),
+            ("تنبيه", "بيانات اصطناعية للاختبار فقط؛ لا تخص أشخاصاً حقيقيين."),
+        ]
+        path = os.path.join(sample_dir, stem)
+        try:
+            if selected.startswith("TXT"):
+                path += ".txt"
+                with open(path, "w", encoding="utf-8") as sample_file:
+                    sample_file.write("سجل تجريبي - بيانات اصطناعية للاختبار فقط\n")
+                    sample_file.write("\n".join(f"{key}: {value}" for key, value in rows[1:]))
+            elif selected.startswith("CSV"):
+                path += ".csv"
+                with open(path, "w", encoding="utf-8-sig", newline="") as sample_file:
+                    csv.writer(sample_file).writerows(rows)
+            elif selected.startswith("PDF"):
+                import fitz
+                path += ".pdf"
+                document = fitz.open()
+                page = document.new_page()
+                page.insert_text((48, 60), "Synthetic PII Demo - TEST DATA ONLY", fontsize=14)
+                pdf_rows = [
+                    ("Name", "Ahmed Ben Salem (synthetic)"),
+                    ("Email", "demo.person@example.com"),
+                    ("Phone", "0551234567"),
+                    ("Test ID", "123456789012345678"),
+                    ("Notice", "Synthetic values for testing only."),
+                ]
+                for index, (key, value) in enumerate(pdf_rows, start=1):
+                    page.insert_text((48, 90 + index * 24), f"{key}: {value}", fontsize=11)
+                document.save(path)
+                document.close()
+            elif selected.startswith("DOCX"):
+                from docx import Document
+                path += ".docx"
+                document = Document()
+                document.add_heading("عينة اصطناعية للاختبار فقط", level=1)
+                for key, value in rows[1:]:
+                    document.add_paragraph(f"{key}: {value}")
+                document.save(path)
+            else:
+                from openpyxl import Workbook
+                path += ".xlsx"
+                workbook = Workbook()
+                sheet = workbook.active
+                sheet.title = "بيانات تجريبية"
+                for row in rows:
+                    sheet.append(row)
+                workbook.save(path)
+            if not self._handle_file_drop(path):
+                return
+            self.results_hint.setText("عينة اصطناعية: راجع النص المستخرج ثم افحصه. استخدم «تحقق» لمراجعة التمويه، ثم صدّر النص المعالج وملخص النتائج.")
+        except Exception as exc:
+            QMessageBox.warning(self, "تعذر إنشاء العينة", f"لم نتمكن من إنشاء ملف العينة بهذه الصيغة:\n{exc}")
+
     def _switch_page(self, index: int):
         for i, btn in enumerate(self.nav_btns):
             if i != index:
                 btn.setChecked(False)
+        if getattr(self, "_page_animation", None):
+            self._page_animation.stop()
+        previous = self.content_stack.currentWidget()
+        if previous and previous.graphicsEffect() is getattr(self, "_page_effect", None):
+            previous.setGraphicsEffect(None)
         self.content_stack.setCurrentIndex(index)
-        
-        if index == 1 and self.user_role == "admin":
+        current = self.content_stack.currentWidget()
+        self._page_effect = QGraphicsOpacityEffect(current)
+        current.setGraphicsEffect(self._page_effect)
+        self._page_animation = QPropertyAnimation(self._page_effect, b"opacity", self)
+        self._page_animation.setDuration(180)
+        self._page_animation.setStartValue(0.72)
+        self._page_animation.setEndValue(1.0)
+        self._page_animation.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._page_animation.start()
+
+        if index == 1:
             self.dashboard_page.refresh_data()
 
     def _check_engine_status(self):
         if self.nlp_enabled:
+            self.engine_capability_lbl.setText("الكشف: تحميل نموذج NLP | OCR: حسب التثبيت")
             QTimer.singleShot(100, self._load_nlp)
         else:
+            self.engine_capability_lbl.setText("الكشف: قواعد محلية فقط | OCR: حسب التثبيت")
             self.status_ind.set_state('ready')
             self.status_lbl.setText("جاهز - وضع التعابير النمطية فقط (Regex Only Mode)")
             self.db.log_audit(self.username, "ENGINE_STATUS", "NLP disabled, Regex only mode.")
             
     def _load_nlp(self):
         self.status_ind.set_state('loading')
-        self.status_lbl.setText("جاري تحميل نموذج الذكاء الاصطناعي... (Loading AI Model...)")
-        QApplication.processEvents()
-        
-        success = self.engine.load_nlp_model(self.model_path)
-        
+        self.status_lbl.setText("تحميل النموذج المحلي في الخلفية... (Loading local model...)")
+        self.btn_scan.setEnabled(False)
+        self.nlp_worker = NLPModelLoadWorker(self.engine, self.model_path, self)
+        self.nlp_worker.load_finished.connect(self._on_nlp_loaded)
+        self.nlp_worker.start()
+
+    def _on_nlp_loaded(self, success: bool):
+        self.btn_scan.setEnabled(True)
         if success:
+            self.engine_capability_lbl.setText("الكشف: القواعد + NLP المحلي | OCR: حسب التثبيت")
             self.status_ind.set_state('ready')
-            self.status_lbl.setText("النموذج جاهز (AI Model Ready)")
+            self.status_lbl.setText("النموذج المحلي جاهز (Local model ready)")
             self.db.log_audit(self.username, "ENGINE_STATUS", "NLP Model loaded successfully.")
         else:
-            self.status_ind.set_state('error')
-            self.status_lbl.setText("فشل تحميل النموذج (AI Model Load Failed)")
-            self.db.log_audit(self.username, "ENGINE_STATUS", "Failed to load NLP Model.")
+            self.engine_capability_lbl.setText("الكشف: قواعد محلية فقط | NLP غير متاح | OCR: حسب التثبيت")
+            self.status_ind.set_state('ready')
+            self.status_lbl.setText("النموذج غير متاح؛ يعمل الفحص بالتعابير المحلية (Regex mode)")
+            self.db.log_audit(self.username, "ENGINE_STATUS", "Local NLP model unavailable; regex detection remains active.")
 
     def _toggle_sync_scroll(self):
         in_bar = self.input_text.verticalScrollBar()
@@ -489,10 +859,34 @@ class AlgPIIMainWindow(QMainWindow):
             extracted_text, self._last_ocr_used = DocumentParser.extract_text(file_path)
             self._last_file_path = file_path
             self.input_text.setText(extracted_text)
-            self.status_lbl.setText(f"تم تحميل الملف: {file_path.split('/')[-1]}")
-            self.db.log_audit(self.username, "FILE_LOAD", f"Loaded file: {file_path}")
+            self._clear_previous_result()
+            self.status_lbl.setText(f"تم تحميل الملف: {os.path.basename(file_path)}")
+            detector = "القواعد + NLP المحلي" if self.engine.use_nlp and self.engine.is_nlp_available() else "القواعد المحلية فقط"
+            ocr = "استُخدم" if self._last_ocr_used else "لم يُستخدم"
+            self.engine_capability_lbl.setText(f"الكشف: {detector} | OCR: {ocr}")
+            extension = os.path.splitext(file_path)[1].lower() or "unknown"
+            self.db.log_audit(self.username, "FILE_LOAD", f"Loaded a document for scanning (format: {extension}). Local path omitted for privacy.")
+            return True
         except Exception as e:
             QMessageBox.warning(self, "خطأ (Error)", f"لا يمكن قراءة الملف: {e}")
+            return False
+
+    def _clear_previous_result(self):
+        self.output_text.clear()
+        for i in reversed(range(self.badges_layout.count())):
+            item = self.badges_layout.takeAt(i)
+            widget = item.widget()
+            if widget:
+                widget.deleteLater()
+        self._last_anon_result = None
+        self._verification_passed = False
+        self._verification_target = None
+        self._last_report = None
+        self._last_scan_id = None
+        self._review_original_entities = []
+        self._review_manual_entities = []
+        self.btn_review.setEnabled(False)
+        self.results_hint.setText("بعد الفحص: راجع التظليل والشارات واضغط «تحقق». كل صيغ التصدير تتضمن النص المعالج وملخص النتائج دون القيم الأصلية المكتشفة.")
 
     def on_scan(self):
         text = self.input_text.toPlainText()
@@ -547,7 +941,15 @@ class AlgPIIMainWindow(QMainWindow):
         self.progress_dlg.setAutoClose(True)
         self.progress_dlg.setValue(0)
         
-        self.batch_worker = BatchWorker(input_dir, output_dir, self.engine, batch_strategy, self.db, self.user_department)
+        self.batch_worker = BatchWorker(
+            input_dir,
+            output_dir,
+            self.engine,
+            batch_strategy,
+            self.db,
+            self.user_department,
+            user_role=self.user_role,
+        )
         self.batch_worker.progress.connect(self._update_batch_progress)
         self.batch_worker.file_completed.connect(lambda f: self.progress_dlg.setLabelText(f"اكتمل (Completed): {f}"))
         self.batch_worker.finished.connect(self._on_batch_finished)
@@ -597,8 +999,51 @@ class AlgPIIMainWindow(QMainWindow):
             self.progress_dlg.setValue(val)
             
     def _on_batch_finished(self, total_processed):
-        QMessageBox.information(self, "اكتمل الفحص (Batch Complete)", f"تمت معالجة {total_processed} ملف(ات) بنجاح.")
-        self.db.log_audit(self.username, "BATCH_SCAN_END", f"Finished batch scan, processed {total_processed} files.")
+        failures = getattr(self.batch_worker, "failure_details", [])
+        summary = f"تم فحص {total_processed} ملف(ات) بنجاح."
+        if total_processed:
+            summary += (
+                "\nلكل ملف ناجح: أُنشئ ملف ‎.anonymized.txt يحتوي النص المستخرج بعد تمويه الكيانات التي اكتشفها المحرك، "
+                "وملف ‎.report.pdf منفصل لملخص الفحص."
+            )
+        summary += f"\nبيان النتائج التفصيلي: {os.path.join(self.batch_worker.output_dir, 'batch_manifest.json')}"
+        if any(item.get("anonymized_original_format") for item in getattr(self.batch_worker, "file_results", [])):
+            summary += (
+                "\nأُنشئت نسخ بصيغتها الأصلية للملفات المدعومة (PDF وDOCX وXLSX وCSV والصور). "
+                "راجع بيان النتائج batch_manifest.json لمعرفة حدود التنقيح الخاصة بكل ملف، وافحص النسخ يدويًا قبل مشاركتها."
+            )
+        review_details = getattr(self.batch_worker, "review_details", [])
+        if review_details:
+            summary += "\n\nتحذير: التحقق من بعض النسخ الأصلية يحتاج مراجعة:"
+            summary += "\n" + "\n".join(
+                f"• {name}: بقيت {leaked} قيمة مكتشفة أصلًا، وظهرت {candidates} نتيجة محتملة."
+                for name, leaked, candidates in review_details[:5]
+            )
+            if len(review_details) > 5:
+                summary += f"\n... و{len(review_details) - 5} ملفات أخرى."
+        if failures:
+            summary += f"\nتعذر فحص {len(failures)} ملف(ات):"
+            summary += "\n" + "\n".join(f"• {name}: {reason}" for name, reason in failures[:5])
+            if len(failures) > 5:
+                summary += f"\n... و{len(failures) - 5} ملفات أخرى."
+        self.db.log_audit(
+            self.username,
+            "BATCH_SCAN_END",
+            f"Finished batch scan: {total_processed} succeeded, {len(failures)} failed.",
+        )
+        if getattr(self, "progress_dlg", None):
+            self.progress_dlg.close()
+        from .batch_results_dialog import BatchResultsDialog
+        results_dialog = BatchResultsDialog(
+            self.batch_worker.output_dir,
+            total_processed,
+            failures,
+            review_details,
+            getattr(self.batch_worker, "file_results", []),
+            summary,
+            self,
+        )
+        results_dialog.exec()
 
     def _on_scan_finished(self):
         self.btn_scan.set_loading(False)
@@ -606,8 +1051,16 @@ class AlgPIIMainWindow(QMainWindow):
 
     def on_scan_complete(self, result: AnonymizedResult):
         self._last_anon_result = result
+        self._verification_passed = False
+        self._verification_target = None
+        self.btn_copy.setEnabled(False)
+        self.btn_export.setEnabled(False)
+        self._review_original_entities = list(result.entities)
+        self._review_manual_entities = []
+        self.btn_review.setEnabled(True)
         self.output_text.setHtml(result.html_highlighted)
         self.status_lbl.setText("اكتمل الفحص (Scan Complete)")
+        self.results_hint.setText("راجع التصنيف والشارات والنص المظلل، ثم شغّل «تحقق». صيغ التصدير تحتوي النص المعالج وملخص النتائج ولا تتضمن القيم الأصلية المكتشفة.")
         
         # Original text reveal (Admin only feature conceptually, but we can just let them see the output)
         # We enforce viewing only redacted in the UI implicitly because output_text sets HTML
@@ -627,8 +1080,8 @@ class AlgPIIMainWindow(QMainWindow):
         # Display Sensitivity Label
         label_color = next((p['label_color'] for p in self.labeling_policies if p['label_name'] == report.sensitivity_label), COLORS['ACCENT'])
         lbl_badge = EntityBadge("التصنيف: " + report.sensitivity_label, 0)
+        lbl_badge.label.setText("التصنيف: " + report.sensitivity_label)
         lbl_badge.setStyleSheet(f"background-color: {label_color}; color: white; border-radius: 12px;")
-        lbl_badge.layout().itemAt(1).widget().hide() # Hide count
         self.badges_layout.addWidget(lbl_badge)
         
         for etype, count in counts.items():
@@ -658,7 +1111,12 @@ class AlgPIIMainWindow(QMainWindow):
             
         # Fingerprinting and Duplicate Detection
         fp = self.fingerprint_engine.compute_fingerprint(result.original_text)
-        duplicates = self.fingerprint_engine.find_duplicates(fp)
+        if self.user_role == "admin":
+            duplicates = self.fingerprint_engine.find_duplicates(fp)
+        elif self.user_department:
+            duplicates = self.fingerprint_engine.find_duplicates(fp, department=self.user_department)
+        else:
+            duplicates = []
         duplicates_found = len(duplicates)
         
         if duplicates_found > 0:
@@ -673,12 +1131,15 @@ class AlgPIIMainWindow(QMainWindow):
         
         # Determine if OCR was used (either from recent file load, or default to False)
         ocr_used = getattr(self, '_last_ocr_used', False)
+        # Keep every completed scan in history, including clean results.
+        last_id = self.db.log_scan(
+            "User_Input", len(result.entities), report.risk_level, self.strategy,
+            counts, report.sensitivity_label, ocr_used, duplicates_found, self.user_department
+        )
+        self._last_scan_id = last_id
+        self.fingerprint_engine.store_fingerprint(last_id, "User_Input", fp)
         
         if result.entities or duplicates_found > 0:
-            # Use user_department
-            last_id = self.db.log_scan("User_Input", len(result.entities), report.risk_level, self.strategy, counts, report.sensitivity_label, ocr_used, duplicates_found, self.user_department)
-            self.fingerprint_engine.store_fingerprint(last_id, "User_Input", fp)
-            
             # Log clusters
             for cluster in report.clusters:
                 self.db.save_cluster(last_id, cluster['reason'], cluster['multiplier'], ",".join(cluster['types']))
@@ -688,7 +1149,9 @@ class AlgPIIMainWindow(QMainWindow):
             doc_name = "User_Input"
             if hasattr(self, '_last_file_path') and self._last_file_path:
                 doc_name = self._last_file_path.split('/')[-1]
-            self.cross_linker.index_scan_result(last_id, doc_name, result.entities, department=None)
+            self.cross_linker.index_scan_result(
+                last_id, doc_name, result.entities, department=self.user_department
+            )
                 
             # Evaluate Compliance Policies
             violations = self.policy_engine.evaluate(result.scan_result, "User_Input")
@@ -724,21 +1187,120 @@ class AlgPIIMainWindow(QMainWindow):
         QMessageBox.critical(self, "خطأ (Error)", f"حدث خطأ أثناء الفحص:\n{msg}")
         self.status_lbl.setText("خطأ (Error)")
 
+    def on_review_entities(self):
+        if not self._last_anon_result:
+            QMessageBox.warning(self, "لا توجد نتيجة", "أجرِ فحصًا قبل مراجعة الكيانات.")
+            return
+
+        from .review_dialog import EntityReviewDialog
+        result = self._last_anon_result
+        automatic_entities = list(getattr(self, "_review_original_entities", result.entities))
+        manual_entities = list(getattr(self, "_review_manual_entities", []))
+        dialog_entities = automatic_entities + manual_entities
+        dialog = EntityReviewDialog(
+            result.original_text, dialog_entities, self, selected_entities=result.entities
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        reviewed_entities = dialog.reviewed_entities()
+        self._verification_passed = False
+        self._verification_target = None
+        self.btn_copy.setEnabled(False)
+        self.btn_export.setEnabled(False)
+        self._review_manual_entities = [
+            entity for entity in dialog.all_entities() if entity.source == "manual_review"
+        ]
+        updated_scan = replace(result.scan_result, entities=reviewed_entities)
+        result.entities = reviewed_entities
+        result.scan_result = updated_scan
+        result.anonymized_text, result.html_highlighted = self.engine.anonymizer.anonymize(
+            result.original_text, reviewed_entities, result.strategy
+        )
+        self._last_report = self.engine.generate_report(updated_scan)
+        self.output_text.setHtml(result.html_highlighted)
+
+        counts = {}
+        for entity in reviewed_entities:
+            counts[entity.entity_type] = counts.get(entity.entity_type, 0) + 1
+        self._refresh_review_badges(self._last_report, counts)
+
+        excluded = len(automatic_entities) - sum(
+            1 for entity in reviewed_entities if entity.source != "manual_review"
+        )
+        added = sum(1 for entity in reviewed_entities if entity.source == "manual_review")
+        if self._last_scan_id:
+            self.db.update_scan_review(
+                self._last_scan_id,
+                len(reviewed_entities),
+                self._last_report.risk_level,
+                counts,
+                self._last_report.sensitivity_label,
+            )
+            self.db.clear_indexed_entities_for_scan(self._last_scan_id)
+            document_name = os.path.basename(self._last_file_path) if self._last_file_path else "User_Input"
+            self.cross_linker.index_scan_result(
+                self._last_scan_id, document_name, reviewed_entities, department=self.user_department
+            )
+            self.db.clear_clusters_for_scan(self._last_scan_id)
+            for cluster in self._last_report.clusters:
+                self.db.save_cluster(
+                    self._last_scan_id, cluster['reason'], cluster['multiplier'], ",".join(cluster['types'])
+                )
+            self.db.log_audit(
+                self.username,
+                "SCAN_REVIEW",
+                f"Reviewed scan {self._last_scan_id}: {excluded} detections excluded, {added} manual matches retained, {len(reviewed_entities)} entities retained.",
+            )
+
+        self.results_hint.setText(
+            f"تم تحديث النتيجة بعد المراجعة: استُبعد {excluded} من النتائج الآلية وأُضيف {added} تطابق يدوي. "
+            "النص المستبعد من الإخفاء سيبقى كما هو. سجل السياسات والحوادث يحتفظ بنتيجة الكشف الأصلية لأغراض التدقيق. راجع النتيجة ثم اضغط «تحقق» قبل التصدير."
+        )
+        self.status_lbl.setText("تم تطبيق المراجعة اليدوية.")
+
+    def _refresh_review_badges(self, report, counts):
+        for i in reversed(range(self.badges_layout.count())):
+            item = self.badges_layout.takeAt(i)
+            widget = item.widget()
+            if widget:
+                widget.deleteLater()
+
+        label_color = next(
+            (policy['label_color'] for policy in self.labeling_policies if policy['label_name'] == report.sensitivity_label),
+            COLORS['ACCENT'],
+        )
+        label_badge = EntityBadge("التصنيف: " + report.sensitivity_label, 0)
+        label_badge.label.setText("التصنيف: " + report.sensitivity_label)
+        label_badge.setStyleSheet(f"background-color: {label_color}; color: white; border-radius: 12px;")
+        self.badges_layout.addWidget(label_badge)
+
+        for entity_type, count in counts.items():
+            self.badges_layout.addWidget(EntityBadge(entity_type, count))
+        if report.clusters:
+            self.badges_layout.addWidget(EntityBadge("عناقيد البيانات", len(report.clusters)))
+        self.badges_layout.addStretch()
+
     def on_clear(self):
         self.input_text.clear()
-        self.output_text.clear()
-        for i in reversed(range(self.badges_layout.count())): 
-            widget = self.badges_layout.itemAt(i).widget()
-            if widget:
-                widget.setParent(None)
+        self._clear_previous_result()
+        self._last_file_path = None
+        self._last_ocr_used = False
+        self.status_lbl.setText("تم مسح النص والنتيجة.")
 
     def on_copy(self):
+        if not self._verification_passed:
+            QMessageBox.warning(self, "التحقق مطلوب", "شغّل التحقق وانتظر نجاحه قبل نسخ النص المعالج.")
+            return
         QApplication.clipboard().setText(self.output_text.toPlainText())
         self.status_lbl.setText("تم النسخ إلى الحافظة (Copied to Clipboard)")
 
     def on_export(self):
         if not hasattr(self, '_last_anon_result') or not self._last_anon_result:
             QMessageBox.warning(self, "تنبيه", "لا توجد نتائج للتصدير. يرجى الفحص أولاً.")
+            return
+        if not self._verification_passed:
+            QMessageBox.warning(self, "التحقق مطلوب", "لا يمكن التصدير قبل نجاح التحقق من النص المعالج.")
             return
             
         formats = "PDF Report (*.pdf);;Word Document (*.docx);;Excel Spreadsheet (*.xlsx);;JSON Format (*.json);;XML Format (*.xml);;CSV Format (*.csv);;Text Files (*.txt)"
@@ -749,21 +1311,21 @@ class AlgPIIMainWindow(QMainWindow):
                 if path.lower().endswith('.pdf'):
                     PDFExporter.export_report(self._last_anon_result, self._last_report, path)
                 elif path.lower().endswith('.docx'):
-                    ReportExporter.save_docx(self._last_anon_result.scan_result, self._last_report, path)
+                    ReportExporter.save_docx(self._last_anon_result.scan_result, self._last_report, path, self._last_anon_result.anonymized_text)
                 elif path.lower().endswith('.xlsx'):
-                    ReportExporter.save_xlsx(self._last_anon_result.scan_result, path)
+                    ReportExporter.save_xlsx(self._last_anon_result.scan_result, path, self._last_report, self._last_anon_result.anonymized_text)
                 elif path.lower().endswith('.json'):
                     with open(path, 'w', encoding='utf-8') as f:
-                        f.write(ReportExporter.to_json(self._last_anon_result.scan_result, self._last_report))
+                        f.write(ReportExporter.to_json(self._last_anon_result.scan_result, self._last_report, self._last_anon_result.anonymized_text))
                 elif path.lower().endswith('.xml'):
                     with open(path, 'w', encoding='utf-8') as f:
-                        f.write(ReportExporter.to_xml(self._last_anon_result.scan_result, self._last_report))
+                        f.write(ReportExporter.to_xml(self._last_anon_result.scan_result, self._last_report, self._last_anon_result.anonymized_text))
                 elif path.lower().endswith('.csv'):
-                    with open(path, 'w', encoding='utf-8') as f:
-                        f.write(ReportExporter.to_csv(self._last_anon_result.scan_result))
+                    with open(path, 'w', encoding='utf-8-sig', newline='') as f:
+                        f.write(ReportExporter.to_csv(self._last_anon_result.scan_result, self._last_report, self._last_anon_result.anonymized_text))
                 else:
                     with open(path, 'w', encoding='utf-8') as f:
-                        f.write(self.output_text.toPlainText())
+                        f.write(self._last_anon_result.anonymized_text)
                 QMessageBox.information(self, "نجاح", f"تم التصدير بنجاح إلى:\n{path}")
             except Exception as e:
                 QMessageBox.critical(self, "خطأ", f"فشل التصدير:\n{str(e)}")
@@ -772,19 +1334,74 @@ class AlgPIIMainWindow(QMainWindow):
         if not hasattr(self, '_last_anon_result') or not self._last_anon_result:
             QMessageBox.warning(self, "تنبيه", "لا توجد نتائج للتحقق. يرجى الفحص أولاً.")
             return
-            
-        original_scan = self._last_anon_result.scan_result
-        anonymized_text = self._last_anon_result.anonymized_text
-        
-        result = RedactionVerifier.verify(original_scan, anonymized_text)
-        
+
+        if getattr(self, "verification_worker", None) and self.verification_worker.isRunning():
+            return
+        current = self._last_anon_result
+        self._verification_target = current
+        self.status_ind.set_state('loading')
+        self.status_lbl.setText("يعيد التحقق من النص المنقح بحثًا عن بيانات محتملة...")
+        self.btn_verify.setEnabled(False)
+        self.btn_scan.setEnabled(False)
+        self.btn_export.setEnabled(False)
+        self.btn_review.setEnabled(False)
+        self.verification_worker = VerificationWorker(
+            current.scan_result, current.anonymized_text, self.engine, self
+        )
+        self.verification_worker.verification_ready.connect(self._on_verification_ready)
+        self.verification_worker.error.connect(self._on_verification_error)
+        self.verification_worker.start()
+
+    def _on_verification_ready(self, result):
+        self.status_ind.set_state('ready')
+        self.btn_verify.setEnabled(True)
+        self.btn_scan.setEnabled(True)
+        has_result = bool(self._last_anon_result)
+        self._verification_passed = bool(
+            result.is_successful and self._last_anon_result is self._verification_target
+        )
+        self.btn_export.setEnabled(has_result and self._verification_passed)
+        self.btn_copy.setEnabled(has_result and self._verification_passed)
+        self.btn_review.setEnabled(has_result)
+        if self._last_anon_result is not self._verification_target:
+            self.status_lbl.setText("تغيرت النتيجة أثناء التحقق؛ شغّل التحقق مجددًا.")
+            return
         if result.is_successful:
-            QMessageBox.information(self, "تحقق ناجح (Verification Passed)", 
-                f"نسبة التمويه: {result.masking_percentage:.1f}%\n{result.details}")
-        else:
-            QMessageBox.warning(self, "تحذير: تسريب بيانات (Leak Warning)", 
-                f"نسبة التمويه: {result.masking_percentage:.1f}%\n{result.details}\n\n"
-                f"الكيانات المسربة: {', '.join([e.text for e in result.leaked_entities])}")
+            QMessageBox.information(
+                self,
+                "اكتمل التحقق",
+                f"نسبة إخفاء الكيانات الأصلية: {result.masking_percentage:.1f}%\n{result.details}",
+            )
+            self.status_lbl.setText("انتهى التحقق؛ لم يعثر الفحص الثاني على كيانات إضافية.")
+            return
+
+        details = [
+            f"نسبة إخفاء الكيانات الأصلية: {result.masking_percentage:.1f}%",
+            result.details,
+        ]
+        if result.leaked_entities:
+            details.append("قيم مكتشفة أصلًا بقيت كما هي: " + ", ".join(e.text for e in result.leaked_entities))
+        if result.residual_entities:
+            candidates = ", ".join(
+                f"{entity.entity_type}: {entity.text}" for entity in result.residual_entities[:10]
+            )
+            details.append("كيانات محتملة في النص المنقح: " + candidates)
+            details.append("راجعها يدويًا؛ قد تكون بعض النتائج إنذارات خاطئة.")
+        QMessageBox.warning(self, "التحقق يحتاج مراجعة", "\n\n".join(details))
+        self.status_lbl.setText("عثر التحقق الثاني على عناصر محتملة؛ راجعها قبل التصدير.")
+
+    def _on_verification_error(self, message: str):
+        self.status_ind.set_state('ready')
+        self.btn_verify.setEnabled(True)
+        self.btn_scan.setEnabled(True)
+        has_result = bool(self._last_anon_result)
+        self._verification_passed = False
+        self._verification_target = None
+        self.btn_export.setEnabled(False)
+        self.btn_copy.setEnabled(False)
+        self.btn_review.setEnabled(has_result)
+        QMessageBox.critical(self, "تعذر التحقق", f"فشل فحص النص المنقح:\n{message}")
+        self.status_lbl.setText("تعذر إكمال التحقق.")
 
     def on_settings(self):
         if self.user_role != "admin":
@@ -794,11 +1411,19 @@ class AlgPIIMainWindow(QMainWindow):
         dlg = SettingsDialog(self.db, self.user_role, self)
         dlg.settings_changed.connect(self._apply_settings)
         dlg.exec()
+        if getattr(dlg, "restore_staged", False):
+            self.force_quit()
         
     def _apply_settings(self, settings: dict):
-        self.nlp_enabled = settings.get('nlp_enabled', True)
+        if "session_idle_minutes" in settings:
+            self.session_activity_monitor.set_timeout(settings["session_idle_minutes"])
+        self.nlp_enabled = settings.get('nlp_enabled', False)
         self.model_path = settings.get('model_path', None)
         self.strategy = settings.get('anonymization_strategy', 'legal_mask')
+        self.ocr_enabled = settings.get('ocr_enabled', True)
+        self.ocr_language = settings.get('ocr_language', 'ara+eng')
+        self.tesseract_cmd = settings.get('tesseract_cmd', '')
+        DocumentParser.configure_ocr(self.ocr_enabled, self.ocr_language, self.tesseract_cmd)
         
         # Dynamically reload custom keywords
         self.custom_keywords = self.db.get_custom_keywords()

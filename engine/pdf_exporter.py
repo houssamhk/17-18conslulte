@@ -1,10 +1,8 @@
 import os
 import logging
-try:
-    import requests as _requests
-except ImportError:
-    _requests = None
+import sys
 from datetime import datetime
+from xml.sax.saxutils import escape
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
@@ -22,33 +20,25 @@ class PDFExporter:
     """Exports Scan Results to a Professional PDF Compliance Report with Arabic support."""
     
     FONT_NAME = "Amiri"
-    FONT_PATH = "assets/Amiri-Regular.ttf"
-    FONT_URL = "https://github.com/aliftype/amiri/raw/main/fonts/ttf/Amiri-Regular.ttf"
+    FONT_PATH = os.path.join("assets", "Amiri-Regular.ttf")
     
     @classmethod
     def _ensure_arabic_font(cls):
-        """Downloads the Arabic font if it doesn't exist and registers it."""
+        """Find a local Arabic-capable font; report generation never downloads files."""
         try:
-            if not os.path.exists('assets'):
-                os.makedirs('assets')
-                
-            if not os.path.exists(cls.FONT_PATH):
-                logging.info(f"Downloading Arabic font from {cls.FONT_URL}...")
-                if _requests is None:
-                    logging.warning("requests not installed - cannot download font.")
-                    return False
-                response = _requests.get(cls.FONT_URL, stream=True, timeout=10)
-                if response.status_code == 200:
-                    with open(cls.FONT_PATH, 'wb') as f:
-                        for chunk in response.iter_content(chunk_size=8192):
-                            f.write(chunk)
-                else:
-                    logging.warning("Failed to download Arabic font.")
-                    return False
-                    
-            # Register the font
-            pdfmetrics.registerFont(TTFont(cls.FONT_NAME, cls.FONT_PATH))
-            return True
+            app_root = getattr(sys, "_MEIPASS", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+            candidates = [
+                os.path.join(app_root, cls.FONT_PATH),
+                os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts", "arial.ttf"),
+                os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts", "tahoma.ttf"),
+                "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            ]
+            for font_path in candidates:
+                if os.path.isfile(font_path):
+                    pdfmetrics.registerFont(TTFont(cls.FONT_NAME, font_path))
+                    return True
+            logging.warning("No local Arabic font found; PDF will use the built-in fallback font.")
+            return False
         except Exception as e:
             logging.error(f"Font setup failed: {e}")
             return False
@@ -62,6 +52,19 @@ class PDFExporter:
             return bidi_text
         except Exception:
             return text
+
+    @classmethod
+    def _safe_paragraph(cls, text: str, style):
+        """Escape user-controlled text before passing it to ReportLab's XML parser."""
+        formatted = cls._format_arabic(str(text or ""))
+        return Paragraph(escape(formatted), style)
+
+    @classmethod
+    def _labeled_paragraph(cls, label: str, value, style):
+        """Keep the trusted label formatting while escaping the supplied value."""
+        safe_label = escape(cls._format_arabic(label))
+        safe_value = escape(cls._format_arabic(str(value or "")))
+        return Paragraph(f"<b>{safe_label}</b> {safe_value}", style)
 
     @classmethod
     def export_report(cls, result: AnonymizedResult, report: ComplianceReport, file_path: str):
@@ -119,7 +122,7 @@ class PDFExporter:
                 
             total_entities = sum(counts.values())
             story.append(Paragraph(cls._format_arabic(f"إجمالي الكيانات الحساسة: {total_entities}"), content_style))
-            story.append(Paragraph(cls._format_arabic(f"استراتيجية التمويه: {result.strategy}"), content_style))
+            story.append(cls._safe_paragraph(f"استراتيجية التمويه: {result.strategy}", content_style))
             
             # Details Table
             if counts:
@@ -148,11 +151,11 @@ class PDFExporter:
                 story.append(Paragraph(cls._format_arabic("المراجع القانونية (Legal References)"), title_style))
                 for article in report.applicable_articles:
                     law_text = f"{article['law_name']} ({article['law_number']}) - {article['article_number']}: {article['article_title_ar']}"
-                    story.append(Paragraph(cls._format_arabic(law_text), content_style))
+                    story.append(cls._safe_paragraph(law_text, content_style))
                     summary_text = f"الملخص: {article['article_summary_ar']}"
-                    story.append(Paragraph(cls._format_arabic(summary_text), subtitle_style))
+                    story.append(cls._safe_paragraph(summary_text, subtitle_style))
                     penalty_text = f"العقوبة: {article['penalty_description_ar']}"
-                    story.append(Paragraph(cls._format_arabic(penalty_text), subtitle_style))
+                    story.append(cls._safe_paragraph(penalty_text, subtitle_style))
                     story.append(Spacer(1, 6))
                 story.append(Spacer(1, 18))
             
@@ -163,8 +166,7 @@ class PDFExporter:
             text_lines = result.anonymized_text.split('\n')
             for line in text_lines:
                 if line.strip():
-                    formatted_line = cls._format_arabic(line)
-                    story.append(Paragraph(formatted_line, content_style))
+                    story.append(cls._safe_paragraph(line, content_style))
                     
             doc.build(story)
             logging.info(f"Successfully generated Arabic PDF report at {file_path}")
@@ -203,15 +205,15 @@ class PDFExporter:
             
             # Project details
             story.append(Paragraph(cls._format_arabic("1. تفاصيل المشروع"), heading_style))
-            story.append(Paragraph(cls._format_arabic(f"<b>المشروع:</b> {pia_data.get('project_name')}"), content_style))
-            story.append(Paragraph(cls._format_arabic(f"<b>القسم:</b> {pia_data.get('department')}"), content_style))
-            story.append(Paragraph(cls._format_arabic(f"<b>المقيِّم:</b> {pia_data.get('assessor_name')}"), content_style))
-            story.append(Paragraph(cls._format_arabic(f"<b>تاريخ التقييم:</b> {pia_data.get('created_at')}"), content_style))
+            story.append(cls._labeled_paragraph("المشروع:", pia_data.get('project_name'), content_style))
+            story.append(cls._labeled_paragraph("القسم:", pia_data.get('department'), content_style))
+            story.append(cls._labeled_paragraph("المقيِّم:", pia_data.get('assessor_name'), content_style))
+            story.append(cls._labeled_paragraph("تاريخ التقييم:", pia_data.get('created_at'), content_style))
             
             story.append(Spacer(1, 12))
             
             story.append(Paragraph(cls._format_arabic("2. الغرض من المعالجة"), heading_style))
-            story.append(Paragraph(cls._format_arabic(pia_data.get('processing_purpose', '')), content_style))
+            story.append(cls._safe_paragraph(pia_data.get('processing_purpose', ''), content_style))
             
             story.append(Spacer(1, 12))
             
@@ -224,14 +226,14 @@ class PDFExporter:
                 except:
                     data_types = [data_types]
             for dt in data_types:
-                story.append(Paragraph(cls._format_arabic(f"• {dt}"), content_style))
+                story.append(cls._safe_paragraph(f"• {dt}", content_style))
                 
             story.append(Spacer(1, 12))
             
             story.append(Paragraph(cls._format_arabic("4. تقييم المخاطر والتخفيف"), heading_style))
-            story.append(Paragraph(cls._format_arabic(f"<b>مستوى الخطر:</b> {pia_data.get('risk_level')}"), content_style))
+            story.append(cls._labeled_paragraph("مستوى الخطر:", pia_data.get('risk_level'), content_style))
             story.append(Paragraph(cls._format_arabic("<b>التدابير الأمنية المتخذة:</b>"), content_style))
-            story.append(Paragraph(cls._format_arabic(pia_data.get('mitigation_steps', '')), content_style))
+            story.append(cls._safe_paragraph(pia_data.get('mitigation_steps', ''), content_style))
             
             doc.build(story)
             logging.info(f"Successfully generated PIA PDF report at {file_path}")
@@ -293,7 +295,7 @@ class PDFExporter:
             elif sec == "Legal References":
                 story.append(Paragraph(cls._format_arabic("المراجع القانونية"), title_style))
                 for ref in report.law_references:
-                    story.append(Paragraph(cls._format_arabic(ref), content_style))
+                    story.append(cls._safe_paragraph(ref, content_style))
                 story.append(Spacer(1, 12))
             elif sec == "Signature Block":
                 story.append(Spacer(1, 50))

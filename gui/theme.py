@@ -5,16 +5,16 @@ import os
 
 # Color Palette
 COLORS = {
-    "BG_MAIN": "#1a1a2e",
-    "BG_PANEL": "#16213e",
-    "BG_BUTTON": "#0f3460",
-    "ACCENT": "#e94560",
-    "ACCENT_PURPLE": "#533483",
-    "TEXT_PRIMARY": "#e0e0e0",
-    "TEXT_SECONDARY": "#a0a0a0",
-    "SUCCESS": "#2ea043",
-    "WARNING": "#d29922",
-    "ERROR": "#f85149"
+    "BG_MAIN": "#0b1220",
+    "BG_PANEL": "#111c2e",
+    "BG_BUTTON": "#1d3553",
+    "ACCENT": "#5be0c1",
+    "ACCENT_PURPLE": "#29425f",
+    "TEXT_PRIMARY": "#e8eff7",
+    "TEXT_SECONDARY": "#99a9ba",
+    "SUCCESS": "#45c89a",
+    "WARNING": "#f3b65d",
+    "ERROR": "#f26b78"
 }
 
 DARK_STYLESHEET = f"""
@@ -66,6 +66,30 @@ QLineEdit:focus, QTextEdit:focus {{
     border-color: {COLORS['ACCENT']};
 }}
 
+QListWidget, QTreeWidget, QTableWidget, QPlainTextEdit {{
+    border: 1px solid {COLORS['BG_BUTTON']};
+    border-radius: 8px;
+    outline: none;
+}}
+
+QTableWidget {{
+    alternate-background-color: #0e1828;
+    gridline-color: #20314a;
+    selection-background-color: #235346;
+    selection-color: {COLORS['TEXT_PRIMARY']};
+}}
+
+QHeaderView::section {{
+    border: none;
+    border-bottom: 1px solid #29425f;
+    padding: 10px 8px;
+    font-weight: bold;
+}}
+
+QPushButton:focus, QComboBox:focus, QCheckBox:focus {{
+    outline: 2px solid {COLORS['ACCENT']};
+}}
+
 QTabWidget::pane {{
     border: 1px solid {COLORS['ACCENT_PURPLE']};
     border-radius: 4px;
@@ -87,8 +111,9 @@ QTabBar::tab:selected {{
 }}
 
 QProgressBar {{
-    border: 2px solid {COLORS['BG_BUTTON']};
-    border-radius: 4px;
+    border: 1px solid {COLORS['BG_BUTTON']};
+    border-radius: 7px;
+    min-height: 12px;
     text-align: center;
     background-color: {COLORS['BG_PANEL']};
 }}

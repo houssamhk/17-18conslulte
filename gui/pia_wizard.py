@@ -5,6 +5,7 @@ from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel,
 from PyQt6.QtCore import Qt
 from storage.secure_db import SecureDatabase
 from gui.theme import COLORS
+from gui.dialog_utils import configure_dialog_size
 
 class PIAWizard(QWizard):
     """Wizard for creating Privacy Impact Assessments."""
@@ -16,7 +17,7 @@ class PIAWizard(QWizard):
         self.username = username
         
         self.setWindowTitle("تقييم أثر الخصوصية (PIA Wizard)")
-        self.setFixedSize(650, 500)
+        configure_dialog_size(self, preferred=(900, 720), minimum=(620, 500))
         
         # Add Pages
         self.addPage(self.create_intro_page())

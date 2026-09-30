@@ -50,7 +50,8 @@ class QuizDialog(QDialog):
         self.selected_option = -1
 
         self.setWindowTitle(f"امتحان تدريبي #{self.quiz_id} (Quiz #{self.quiz_id})")
-        self.setMinimumWidth(550)
+        from .dialog_utils import configure_dialog_size
+        configure_dialog_size(self, preferred=(860, 680), minimum=(520, 420))
         self.setModal(True)
         self._init_ui()
 
@@ -68,6 +69,13 @@ class QuizDialog(QDialog):
         main_layout = QVBoxLayout(self)
         main_layout.setSpacing(16)
         main_layout.setContentsMargins(24, 24, 24, 24)
+
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setFrameShape(QScrollArea.Shape.NoFrame)
+        scroll_content = QWidget()
+        content_layout = QVBoxLayout(scroll_content)
+        content_layout.setSpacing(16)
 
         # Header with category and difficulty badges
         header_layout = QHBoxLayout()
@@ -109,7 +117,7 @@ class QuizDialog(QDialog):
         """)
         header_layout.addWidget(diff_badge)
         
-        main_layout.addLayout(header_layout)
+        content_layout.addLayout(header_layout)
 
         # Question Box (Card Frame)
         q_frame = QFrame()
@@ -134,7 +142,7 @@ class QuizDialog(QDialog):
             border: none;
         """)
         q_layout.addWidget(q_label)
-        main_layout.addWidget(q_frame)
+        content_layout.addWidget(q_frame)
 
         # Options Container Frame
         options_frame = QFrame()
@@ -182,7 +190,10 @@ class QuizDialog(QDialog):
             self.button_group.addButton(radio, idx)
             options_layout.addWidget(radio)
 
-        main_layout.addWidget(options_frame)
+        content_layout.addWidget(options_frame)
+        content_layout.addStretch()
+        scroll_area.setWidget(scroll_content)
+        main_layout.addWidget(scroll_area, 1)
 
         # Action Buttons Layout
         btn_layout = QHBoxLayout()
@@ -232,7 +243,8 @@ class ComprehensiveExamDialog(QDialog):
         self.button_groups = {}  # quiz_id -> QButtonGroup
 
         self.setWindowTitle("الامتحان الشامل في الامتثال (Comprehensive Compliance Exam)")
-        self.setMinimumSize(680, 600)
+        from .dialog_utils import configure_dialog_size
+        configure_dialog_size(self, preferred=(900, 740), minimum=(620, 500))
         self.setModal(True)
         self._init_ui()
 

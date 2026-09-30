@@ -1,4 +1,5 @@
 import html
+import secrets
 from typing import List, Tuple, Dict
 from .regex_detector import DetectedEntity
 
@@ -25,22 +26,9 @@ class Anonymizer:
         "MISC": "#a0a0a0"      # Gray
     }
 
-    # Consistent fake data for pseudonymization (simple mock mapping)
-    PSEUDO_MAP = {
-        "NIN": "100000000000000000",
-        "PHONE": "0550000000",
-        "CCP": "0000000000 00",
-        "RIB": "00000000000000000000",
-        "NIF": "000000000000000",
-        "IBAN": "DZ0000000000000000000000",
-        "EMAIL": "user@example.dz",
-        "PASSPORT": "A00000000",
-        "PER": "فلان الفلاني",
-        "LOC": "الجزائر العاصمة",
-        "ORG": "مؤسسة وطنية",
-        "CUSTOM": "[محتوى محظور]",
-        "MISC": "بيانات"
-    }
+    def __init__(self):
+        # Tokens are stable only for this process and never resemble valid identifiers.
+        self._pseudonyms = {}
 
     def anonymize(self, text: str, entities: List[DetectedEntity], strategy: str = 'legal') -> Tuple[str, str]:
         """
@@ -100,8 +88,10 @@ class Anonymizer:
             return f"{text[0]}████{text[-1]}"
             
         elif strategy == "pseudonymize":
-            # Replace with generic fake data based on type
-            return self.PSEUDO_MAP.get(entity.entity_type, "[PSEUDO]")
+            key = (entity.entity_type, entity.text)
+            if key not in self._pseudonyms:
+                self._pseudonyms[key] = f"[{entity.entity_type}-{secrets.token_hex(8).upper()}]"
+            return self._pseudonyms[key]
             
         # Default fallback
         return "[MASKED]"

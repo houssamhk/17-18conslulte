@@ -1,10 +1,12 @@
 from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton, 
                              QLabel, QScrollArea, QFrame, QMessageBox, QDialog,
-                             QFormLayout, QTextEdit, QComboBox)
+                             QFormLayout, QTextEdit, QComboBox, QDialogButtonBox,
+                             QSizePolicy)
 from PyQt6.QtCore import Qt, QTimer
 from datetime import datetime
 from storage.secure_db import SecureDatabase
 from .theme import COLORS
+from .dialog_utils import configure_dialog_size
 
 
 class IncidentCard(QFrame):
@@ -59,14 +61,18 @@ class IncidentCard(QFrame):
         layout.addWidget(sla_lbl)
         
         # Action Buttons
-        btn_layout = QHBoxLayout()
-        if incident_data[4] != 'CLOSED':
-            act_btn = QPushButton("إجراء (Action)")
-            act_btn.setStyleSheet(f"background-color: {COLORS['BG_BUTTON']}; color: white;")
-            act_btn.clicked.connect(self.on_action)
-            btn_layout.addWidget(act_btn)
+        btn_layout = QVBoxLayout()
+        btn_layout.setSpacing(8)
+        act_btn = QPushButton("تحديث الحالة والملاحظات")
+        act_btn.setMinimumHeight(38)
+        act_btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        act_btn.setStyleSheet(f"background-color: {COLORS['BG_BUTTON']}; color: white;")
+        act_btn.clicked.connect(self.on_action)
+        btn_layout.addWidget(act_btn)
             
-        evid_btn = QPushButton("تصدير الأدلة (Export Evidence)")
+        evid_btn = QPushButton("تصدير الأدلة")
+        evid_btn.setMinimumHeight(38)
+        evid_btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         evid_btn.setStyleSheet(f"background-color: {COLORS['ACCENT_PURPLE']}; color: white;")
         evid_btn.clicked.connect(self.on_export_evidence)
         btn_layout.addWidget(evid_btn)
@@ -98,31 +104,76 @@ class IncidentActionDialog(QDialog):
     def __init__(self, incident_data, parent=None):
         super().__init__(parent)
         self.setWindowTitle("تحديث الحادث (Update Incident)")
-        self.resize(400, 300)
-        
-        layout = QFormLayout(self)
+        configure_dialog_size(self, preferred=(700, 620), minimum=(480, 440))
+        self.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(24, 24, 24, 20)
+        layout.setSpacing(12)
+
+        title = QLabel(f"تحديث الحادث رقم #{incident_data[0]}")
+        title.setStyleSheet(f"font-size: 18px; font-weight: bold; color: {COLORS['TEXT_PRIMARY']};")
+        layout.addWidget(title)
+        guidance = QLabel("حدّث حالة الحادث والمسؤول عنه، ثم أضف ملاحظة توثّق الإجراء.")
+        guidance.setWordWrap(True)
+        guidance.setStyleSheet(f"color: {COLORS['TEXT_SECONDARY']};")
+        layout.addWidget(guidance)
+
+        status_label = QLabel("حالة الحادث")
+        status_label.setStyleSheet("font-weight: bold;")
+        layout.addWidget(status_label)
         
         self.status_combo = QComboBox()
-        self.status_combo.addItems(["OPEN", "INVESTIGATING", "REMEDIATED", "CLOSED"])
-        self.status_combo.setCurrentText(incident_data[4])
+        for value, label in (
+            ("OPEN", "مفتوح | OPEN"),
+            ("INVESTIGATING", "قيد التحقيق | INVESTIGATING"),
+            ("REMEDIATED", "تمت المعالجة | REMEDIATED"),
+            ("CLOSED", "مغلق | CLOSED"),
+        ):
+            self.status_combo.addItem(label, value)
+        index = self.status_combo.findData(incident_data[4])
+        if index >= 0:
+            self.status_combo.setCurrentIndex(index)
+        self.status_combo.setMinimumHeight(44)
+        layout.addWidget(self.status_combo)
+
+        assignee_label = QLabel("المسؤول عن المتابعة")
+        assignee_label.setStyleSheet("font-weight: bold;")
+        layout.addWidget(assignee_label)
         
         self.assignee_input = QComboBox()
-        self.assignee_input.addItems(["admin", "security_team", "legal_team"])
-        if incident_data[5]:
-            self.assignee_input.setCurrentText(incident_data[5])
+        for value, label in (
+            ("admin", "مسؤول النظام | admin"),
+            ("security_team", "فريق الأمن | security_team"),
+            ("legal_team", "الفريق القانوني | legal_team"),
+        ):
+            self.assignee_input.addItem(label, value)
+        if incident_data[5] and self.assignee_input.findData(incident_data[5]) < 0:
+            self.assignee_input.addItem(str(incident_data[5]), incident_data[5])
+        index = self.assignee_input.findData(incident_data[5]) if incident_data[5] else -1
+        if index >= 0:
+            self.assignee_input.setCurrentIndex(index)
+        self.assignee_input.setMinimumHeight(44)
+        layout.addWidget(self.assignee_input)
             
+        notes_label = QLabel("ملاحظات الإجراء")
+        notes_label.setStyleSheet("font-weight: bold;")
+        layout.addWidget(notes_label)
         self.notes_input = QTextEdit()
-        
-        layout.addRow("الحالة (Status):", self.status_combo)
-        layout.addRow("تعيين إلى (Assign To):", self.assignee_input)
-        layout.addRow("ملاحظات (Notes):", self.notes_input)
-        
-        btn = QPushButton("حفظ (Save)")
-        btn.clicked.connect(self.accept)
-        layout.addRow(btn)
+        self.notes_input.setPlaceholderText("اكتب الإجراء المتخذ أو سبب تغيير الحالة...")
+        self.notes_input.setMinimumHeight(150)
+        layout.addWidget(self.notes_input, 1)
+
+        self.buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel
+        )
+        self.buttons.button(QDialogButtonBox.StandardButton.Save).setText("حفظ التحديث")
+        self.buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("إلغاء")
+        self.buttons.accepted.connect(self.accept)
+        self.buttons.rejected.connect(self.reject)
+        layout.addWidget(self.buttons)
         
     def get_data(self):
-        return self.status_combo.currentText(), self.assignee_input.currentText(), self.notes_input.toPlainText()
+        return self.status_combo.currentData(), self.assignee_input.currentData(), self.notes_input.toPlainText()
 
 
 class IncidentsPageWidget(QWidget):
@@ -140,8 +191,16 @@ class IncidentsPageWidget(QWidget):
         title.setStyleSheet(f"font-size: 20px; font-weight: bold; color: {COLORS['TEXT_PRIMARY']};")
         layout.addWidget(title)
         
-        # Kanban Board
-        board_layout = QHBoxLayout()
+        # Horizontally scrollable Kanban board keeps all columns readable on narrow screens.
+        board_scroll = QScrollArea()
+        board_scroll.setWidgetResizable(True)
+        board_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        board_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        board_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        board_widget = QWidget()
+        board_layout = QHBoxLayout(board_widget)
+        board_layout.setContentsMargins(4, 4, 4, 4)
+        board_layout.setSpacing(12)
         
         self.columns = {
             "OPEN": self._create_column("مفتوح (Open)"),
@@ -151,9 +210,12 @@ class IncidentsPageWidget(QWidget):
         }
         
         for col in self.columns.values():
+            col.setMinimumWidth(280)
+            col.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
             board_layout.addWidget(col)
-            
-        layout.addLayout(board_layout)
+        board_widget.setMinimumWidth(4 * 280 + 3 * 12 + 16)
+        board_scroll.setWidget(board_widget)
+        layout.addWidget(board_scroll, 1)
         
     def _create_column(self, title_text):
         col_widget = QFrame()

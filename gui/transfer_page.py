@@ -2,8 +2,8 @@
 Transfer Page Widget for Alg-PII Engine
 Feature #28: Secure Inter-Department Document Transfer
 
-Provides an enterprise interface for requesting and tracking secure document transfers
-between departments with masking and anonymization enforcement (Law 18-07 compliance).
+Provides an administrative register for inter-department transfer requests. It does not
+redact or move files; those actions must be completed and verified separately.
 """
 
 import logging
@@ -66,8 +66,8 @@ class TransferPageWidget(QWidget):
     Feature #28: Secure Inter-Department Document Transfer Widget.
 
     Allows users to request transfers of scanned documents to target departments
-    using specified masking strategies (Legal Mask, Full Mask), and monitor
-    the status of all inter-department transfers.
+    with a requested masking strategy and monitor approval status. This page does not
+    create an anonymized artifact or move documents.
     """
 
     def __init__(self, db: SecureDatabase, current_department_id: int = None, current_username: str = None, parent=None):
@@ -121,9 +121,9 @@ class TransferPageWidget(QWidget):
         header_layout = QHBoxLayout()
         header_left = QVBoxLayout()
 
-        title_lbl = QLabel("النقل الآمن للمستندات بين الأقسام (Secure Inter-Department Document Transfer)")
+        title_lbl = QLabel("طلبات نقل المستندات بين الأقسام (Inter-Department Transfer Requests)")
         title_lbl.setStyleSheet(f"font-size: 18px; font-weight: bold; color: {COLORS['TEXT_PRIMARY']};")
-        subtitle_lbl = QLabel("نقل الوثائق المفحوصة مع تطبيق قواعد التعتيم وحماية الهوية طبقاً للقانون 18-07 (Law 18-07 Compliance)")
+        subtitle_lbl = QLabel("تسجيل الطلب ومتابعة الموافقة فقط. هذه الشاشة لا تعمّي الملفات ولا تنقلها؛ نفّذ التعتيم وتحقق منه ثم انقل الملف المعالج عبر قناة آمنة.")
         subtitle_lbl.setStyleSheet(f"font-size: 12px; color: {COLORS['TEXT_SECONDARY']};")
 
         header_left.addWidget(title_lbl)
@@ -189,6 +189,17 @@ class TransferPageWidget(QWidget):
         form_header.addStretch()
         form_layout.addLayout(form_header)
 
+        workflow_note = QLabel(
+            "تنبيه سير العمل: اختيار الاستراتيجية يسجل النية فقط. الموافقة لا تنشئ نسخة معماة ولا تنقل ملفًا. "
+            "يجب تنفيذ التعتيم والتحقق من الناتج خارج هذه الشاشة قبل مشاركته."
+        )
+        workflow_note.setWordWrap(True)
+        workflow_note.setStyleSheet(
+            f"color: {COLORS['WARNING']}; background-color: {COLORS['BG_MAIN']}; "
+            "border-radius: 6px; padding: 8px;"
+        )
+        form_layout.addWidget(workflow_note)
+
         # Form Inputs Grid
         grid = QGridLayout()
         grid.setHorizontalSpacing(15)
@@ -229,7 +240,7 @@ class TransferPageWidget(QWidget):
         scan_input_box.addWidget(self.scan_id_input)
         scan_input_box.addWidget(self.scan_combo)
 
-        lbl_strategy = QLabel("استراتيجية التعتيم (Strategy):")
+        lbl_strategy = QLabel("استراتيجية التعتيم المطلوبة (Requested Strategy):")
         lbl_strategy.setStyleSheet(f"color: {COLORS['TEXT_SECONDARY']}; font-weight: bold;")
         self.strategy_combo = QComboBox()
         self.strategy_combo.setStyleSheet(self._combo_style())
@@ -611,7 +622,8 @@ class TransferPageWidget(QWidget):
                 action_layout.addWidget(btn_approve)
                 action_layout.addWidget(btn_reject)
             else:
-                lbl_done = QLabel("مكتمل (Done)")
+                decision_label = "تمت الموافقة" if status in ("APPROVED", "COMPLETED") else "مرفوض"
+                lbl_done = QLabel(decision_label)
                 lbl_done.setStyleSheet(f"color: {COLORS['TEXT_SECONDARY']}; font-size: 11px;")
                 lbl_done.setAlignment(Qt.AlignmentFlag.AlignCenter)
                 action_layout.addWidget(lbl_done)
@@ -621,7 +633,7 @@ class TransferPageWidget(QWidget):
     def _change_status(self, transfer_id: int, new_status: str):
         """Update transfer status and refresh view."""
         try:
-            self.db.update_transfer_status(transfer_id, new_status)
+            self.db.update_transfer_status(transfer_id, new_status, self.current_username)
             QMessageBox.information(
                 self,
                 "تحديث الحالة (Status Updated)",
@@ -674,8 +686,9 @@ class TransferPageWidget(QWidget):
         sender = self.current_username or "admin"
         receiver = self.target_dept_combo.currentText().split("(")[0].strip()
 
-        # Anonymized scan id can link to orig_scan_id
-        anon_scan_id = orig_scan_id
+        # Approval tracking does not create an anonymized scan artifact.
+        # Keep this NULL until a real processed scan is produced by a workflow.
+        anon_scan_id = None
 
         try:
             new_id = self.db.create_transfer(
@@ -692,7 +705,7 @@ class TransferPageWidget(QWidget):
             QMessageBox.information(
                 self,
                 "نجاح العملية (Success)",
-                f"تم إرسال طلب نقل المستند بنجاح برقم: #{new_id}\n(Transfer request submitted successfully)."
+                f"تم تسجيل طلب النقل للمراجعة برقم: #{new_id}. لم يُعمَّ الملف ولم يُنقل تلقائيًا."
             )
 
             # Reset form inputs

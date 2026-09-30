@@ -112,7 +112,7 @@ class FingerprintEngine:
         """Compute the fingerprint for a document text."""
         return SimHash.compute(text)
     
-    def find_duplicates(self, fingerprint: int) -> List[Tuple[int, str, float]]:
+    def find_duplicates(self, fingerprint: int, department: str = None) -> List[Tuple[int, str, float]]:
         """
         Compare a fingerprint against all stored fingerprints.
         Returns list of (scan_id, document_name, similarity_score) for matches above threshold.
@@ -120,7 +120,7 @@ class FingerprintEngine:
         if self.db is None:
             return []
             
-        stored = self.db.get_fingerprints()
+        stored = self.db.get_fingerprints(department=department)
         duplicates = []
         
         for scan_id, doc_name, stored_fp in stored:

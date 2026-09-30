@@ -19,6 +19,7 @@ import qtawesome as qta
 from storage.secure_db import SecureDatabase
 from gui.theme import COLORS
 from gui.widgets import AnimatedButton
+from .dialog_utils import configure_dialog_size
 
 logger = logging.getLogger(__name__)
 
@@ -68,7 +69,7 @@ class DeadlineDetailsDialog(QDialog):
         super().__init__(parent)
         self.deadline = deadline
         self.setWindowTitle("تفاصيل الموعد النهائي (Deadline Details)")
-        self.setFixedSize(520, 360)
+        configure_dialog_size(self, preferred=(680, 520), minimum=(480, 360))
         self.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
 
         self.setStyleSheet(f"""

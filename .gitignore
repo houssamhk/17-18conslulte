@@ -1,4 +1,5 @@
 # === Python ===
+node_modules/
 __pycache__/
 *.py[cod]
 *$py.class
@@ -34,8 +35,13 @@ onnx_quantized/
 *.onnx
 *.db
 *.db-journal
+*.legacy-backup.fernet*
 logs/
 *.log
+document_vault/
+license_db.sqlite
+licenses/private_signing_key.pem
 
 # === Model Cache ===
 models_cache/
+.next/

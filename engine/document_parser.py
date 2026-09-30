@@ -1,6 +1,8 @@
 import os
 import csv
 import logging
+import tempfile
+import shutil
 
 from typing import Tuple
 
@@ -10,6 +12,44 @@ class DocumentParser:
     Extracts plain text from various file formats (TXT, PDF, DOCX, XLSX, CSV).
     Returns (extracted_text, ocr_used)
     """
+    _ocr_enabled = True
+    _ocr_language = "ara+eng"
+    _tesseract_cmd = ""
+
+    @classmethod
+    def configure_ocr(cls, enabled=True, language="ara+eng", tesseract_cmd=""):
+        cls._ocr_enabled = bool(enabled)
+        cls._ocr_language = language or "ara+eng"
+        cls._tesseract_cmd = (tesseract_cmd or "").strip()
+
+    @classmethod
+    def get_ocr_config(cls):
+        return cls._ocr_enabled, cls._ocr_language, cls._tesseract_cmd
+
+    @classmethod
+    def validate_ocr_configuration(cls, language=None, tesseract_cmd=None):
+        try:
+            import pytesseract
+            configured_path = (tesseract_cmd if tesseract_cmd is not None else cls._tesseract_cmd) or ""
+            if configured_path:
+                if not os.path.isfile(configured_path):
+                    return False, "مسار tesseract.exe غير موجود."
+                pytesseract.pytesseract.tesseract_cmd = configured_path
+            else:
+                path_from_env = shutil.which("tesseract")
+                if not path_from_env:
+                    return False, "لم يُعثر على Tesseract في PATH؛ حدد مسار tesseract.exe."
+                pytesseract.pytesseract.tesseract_cmd = path_from_env
+
+            pytesseract.get_tesseract_version()
+            requested = (language if language is not None else cls._ocr_language) or "ara+eng"
+            available = set(pytesseract.get_languages(config=""))
+            missing = [item for item in requested.split("+") if item not in available]
+            if missing:
+                return False, "حزم اللغة غير مثبتة: " + ", ".join(missing)
+            return True, "Tesseract وحزم اللغة المطلوبة جاهزة."
+        except Exception as exc:
+            return False, f"تعذر تشغيل Tesseract: {exc}"
 
     @staticmethod
     def extract_text(file_path: str) -> Tuple[str, bool]:
@@ -85,7 +125,7 @@ class DocumentParser:
             return "\n".join(text_content)
         except ImportError:
             logging.warning("extract-msg not installed. Cannot parse .msg files.")
-            return "ERROR: extract-msg package required to read .msg files."
+            raise RuntimeError("Install the extract-msg package to read Outlook .msg files.")
 
     @staticmethod
     def _parse_txt(file_path: str) -> str:
@@ -105,10 +145,11 @@ class DocumentParser:
                 if text:
                     is_scanned = False
                     text_content.append(text)
-                else:
+                elif DocumentParser._ocr_enabled:
                     # Try OCR on the page if it's empty (scanned image)
-                    pix = page.get_pixmap()
-                    img_path = f"temp_page_{page.number}.png"
+                    pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
+                    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as temp_image:
+                        img_path = temp_image.name
                     pix.save(img_path)
                     try:
                         ocr_text = DocumentParser._parse_image(img_path)
@@ -118,41 +159,47 @@ class DocumentParser:
                     finally:
                         if os.path.exists(img_path):
                             os.remove(img_path)
+                elif page.get_images(full=True):
+                    raise RuntimeError("هذا PDF ممسوح ضوئيًا وOCR معطل. فعّل OCR من الإعدادات لفحصه.")
                             
         return "\n\n".join(text_content), ocr_used
 
     @staticmethod
     def _parse_image(file_path: str) -> str:
+        if not DocumentParser._ocr_enabled:
+            raise RuntimeError("تم تعطيل OCR من الإعدادات؛ لا يمكن استخراج النص من الصورة.")
         try:
             import cv2
-            import numpy as np
             import pytesseract
             from PIL import Image
-            
-            # Preprocess image with OpenCV for better OCR results
-            img = cv2.imread(file_path)
-            if img is None:
-                return ""
-                
-            # Convert to grayscale
-            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-            
-            # Denoise
-            denoised = cv2.fastNlMeansDenoising(gray, h=30)
-            
-            # Thresholding (binarization)
-            _, thresh = cv2.threshold(denoised, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-            
-            # Convert back to PIL Image for pytesseract
-            pil_img = Image.fromarray(thresh)
-            
-            # Extract text using Arabic and English (ara+eng)
-            # You must have tesseract installed on your system with these language packs
-            text = pytesseract.image_to_string(pil_img, lang='ara+eng')
-            return text.strip()
-        except ImportError:
-            logging.warning("pytesseract or opencv-python not installed. Skipping OCR.")
-            return ""
+        except ImportError as exc:
+            logging.error("OCR dependencies are missing; refusing to treat the image as text-free.")
+            raise RuntimeError(
+                "Image OCR is unavailable. Install opencv-python-headless and pytesseract, "
+                "plus the Tesseract executable with Arabic and English language data."
+            ) from exc
+
+        # Preprocess with OpenCV before OCR. Any missing executable/language pack
+        # error is propagated so a scan cannot silently report an image as clean.
+        img = cv2.imread(file_path)
+        if img is None:
+            raise RuntimeError("OCR could not open this image file.")
+
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        denoised = cv2.fastNlMeansDenoising(gray, h=30)
+        _, thresh = cv2.threshold(denoised, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        pil_img = Image.fromarray(thresh)
+        configured_path = DocumentParser._tesseract_cmd
+        if configured_path:
+            if not os.path.isfile(configured_path):
+                raise RuntimeError("مسار Tesseract المحدد غير موجود: " + configured_path)
+            pytesseract.pytesseract.tesseract_cmd = configured_path
+        else:
+            path_from_env = shutil.which("tesseract")
+            if not path_from_env:
+                raise RuntimeError("Tesseract OCR غير موجود في PATH. حدّد مسار tesseract.exe من الإعدادات.")
+            pytesseract.pytesseract.tesseract_cmd = path_from_env
+        return pytesseract.image_to_string(pil_img, lang=DocumentParser._ocr_language).strip()
 
     @staticmethod
     def _parse_docx(file_path: str) -> str:

@@ -8,12 +8,11 @@ from storage.key_manager import KeyManager
 class SecureVault:
     """Manages AES-256 encrypted storage for sensitive documents."""
     
-    def __init__(self, db: SecureDatabase, vault_dir: str = 'd:/draham/storage/document_vault'):
+    def __init__(self, db: SecureDatabase, vault_dir: str = None):
         self.db = db
-        self.vault_dir = vault_dir
-        
-        if not os.path.exists(self.vault_dir):
-            os.makedirs(self.vault_dir)
+        database_dir = os.path.dirname(os.path.abspath(db.db_path))
+        self.vault_dir = os.path.abspath(vault_dir or os.path.join(database_dir, 'document_vault'))
+        os.makedirs(self.vault_dir, mode=0o700, exist_ok=True)
             
         # We reuse the main encryption key, or generate a specific one for the vault
         key = KeyManager.ensure_key()
@@ -62,7 +61,7 @@ class SecureVault:
         vault_path, original_filename = row
         
         if os.path.isdir(destination_path):
-            destination_path = os.path.join(destination_path, original_filename)
+            destination_path = os.path.join(destination_path, os.path.basename(original_filename))
             
         try:
             with open(vault_path, 'rb') as f:

@@ -1,7 +1,7 @@
 import pyqtgraph as pg
 import json
 from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QFrame, 
-                             QTableWidget, QTableWidgetItem, QHeaderView, QSplitter)
+                             QTableWidget, QTableWidgetItem, QHeaderView, QSplitter, QPushButton)
 from PyQt6.QtCore import Qt
 from storage.secure_db import SecureDatabase
 from .theme import COLORS
@@ -104,17 +104,25 @@ class DashboardWidget(QWidget):
         
         # Audit Log Table
         audit_panel = QWidget()
+        self.audit_panel = audit_panel
         audit_layout = QVBoxLayout(audit_panel)
         audit_lbl = QLabel("سجل النظام (Audit Log)")
         audit_lbl.setStyleSheet(f"color: {COLORS['ACCENT']}; font-weight: bold;")
+        audit_header = QHBoxLayout()
+        audit_header.addWidget(audit_lbl)
+        audit_header.addStretch()
+        self.audit_details_btn = QPushButton("فتح السجل الكامل")
+        self.audit_details_btn.clicked.connect(self._open_audit_log)
+        audit_header.addWidget(self.audit_details_btn)
         self.audit_table = QTableWidget(0, 4)
         self.audit_table.setHorizontalHeaderLabels(["التاريخ والوقت", "المستخدم", "الإجراء", "التفاصيل"])
         self.audit_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
-        audit_layout.addWidget(audit_lbl)
+        audit_layout.addLayout(audit_header)
         audit_layout.addWidget(self.audit_table)
         
         # Anomalies Table
         anomaly_panel = QWidget()
+        self.anomaly_panel = anomaly_panel
         anomaly_layout = QVBoxLayout(anomaly_panel)
         anomaly_lbl = QLabel("تنبيهات الشذوذ (Anomaly Alerts)")
         anomaly_lbl.setStyleSheet(f"color: {COLORS['ERROR']}; font-weight: bold;")
@@ -123,18 +131,41 @@ class DashboardWidget(QWidget):
         self.anomaly_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         anomaly_layout.addWidget(anomaly_lbl)
         anomaly_layout.addWidget(self.anomaly_table)
+
+        # Audit and anomaly feeds contain organization-wide security data.
+        # Keep them available only to administrators until department-aware
+        # authorization is implemented for those records.
+        is_admin = self.user_role == "admin"
+        self.audit_panel.setVisible(is_admin)
+        self.anomaly_panel.setVisible(is_admin)
+        if not is_admin:
+            self.card_anomalies.setVisible(False)
+            if not self.user_department:
+                scan_lbl.setText("سجل الفحوصات — يلزم إسناد حسابك إلى قسم لعرض بياناته")
         
         splitter.addWidget(scan_panel)
         splitter.addWidget(audit_panel)
         splitter.addWidget(anomaly_panel)
         layout.addWidget(splitter, stretch=2)
+
+    def _open_audit_log(self):
+        from .audit_log_dialog import AuditLogDialog
+        dialog = AuditLogDialog(self.db, self)
+        dialog.exec()
         
     def refresh_data(self):
         """Fetches latest data from DB and updates charts and tables."""
         try:
             # 1. Update Scans and Chart
-            dept_filter = self.user_department if self.user_role != 'admin' else None
-            history = self.db.get_scan_history(limit=50, department=dept_filter) 
+            is_admin = self.user_role == "admin"
+            dept_filter = self.user_department if not is_admin else None
+            # Passing None to get_scan_history means all departments. An
+            # unassigned standard account must never fall through to that path.
+            history = (
+                self.db.get_scan_history(limit=50, department=dept_filter)
+                if is_admin or dept_filter
+                else []
+            )
             
             total_scans = len(history)
             total_entities = 0
@@ -174,7 +205,7 @@ class DashboardWidget(QWidget):
             self.card_high_risk.set_value(str(high_risk_count))
             
             # 1.5 Update Anomalies
-            anomalies = self.db.get_unacknowledged_anomalies()
+            anomalies = self.db.get_unacknowledged_anomalies() if is_admin else []
             self.card_anomalies.set_value(str(len(anomalies)))
             
             self.anomaly_table.setRowCount(0)
@@ -190,8 +221,9 @@ class DashboardWidget(QWidget):
             
             # Calculate Compliance Score (100% means 0 high risk files, 0 open incidents, 0 open violations)
             # Fetch open incidents and violations to penalize score
-            incidents = self.db.get_incidents()
-            open_incidents = len([inc for inc in incidents if inc['status'] != 'CLOSED'])
+            incidents = self.db.get_incidents() if is_admin else []
+            # SecureDatabase returns SQLite tuples; status is the fifth selected column.
+            open_incidents = sum(1 for inc in incidents if inc[4] != 'CLOSED')
             
             policies = self.db.get_active_policies()
             # simplified: each high risk scan = -5 points, open incident = -10 points, anomaly = -5 points
@@ -217,7 +249,7 @@ class DashboardWidget(QWidget):
                 self.plot_widget.getAxis('bottom').setTicks(ticks)
                 
             # 2. Update Audit Log Table
-            audits = self.db.get_audit_log(limit=50)
+            audits = self.db.get_audit_log(limit=50) if is_admin else []
             self.audit_table.setRowCount(0)
             for i, log in enumerate(audits):
                 self.audit_table.insertRow(i)

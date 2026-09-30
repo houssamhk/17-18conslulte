@@ -3,6 +3,7 @@ from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel,
 from PyQt6.QtCore import Qt
 from engine.license_manager import LicenseManager
 from .theme import COLORS
+from .dialog_utils import configure_dialog_size
 
 class LicenseDialog(QDialog):
     """Modal dialog forcing the user to enter a valid license key."""
@@ -10,7 +11,7 @@ class LicenseDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("تفعيل البرنامج | Software Activation")
-        self.setFixedSize(500, 300)
+        configure_dialog_size(self, preferred=(640, 460), minimum=(480, 360))
         self.setWindowFlags(self.windowFlags() & ~Qt.WindowType.WindowCloseButtonHint) # Prevent closing
         
         self.hwid = LicenseManager.get_hardware_id()

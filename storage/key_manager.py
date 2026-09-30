@@ -2,7 +2,6 @@ import keyring
 import logging
 from typing import Optional
 from cryptography.fernet import Fernet
-import os
 
 class KeyManager:
     """
@@ -11,6 +10,7 @@ class KeyManager:
     """
     SERVICE_NAME = 'AlgPIIEngine'
     KEY_ACCOUNT = 'master_key'
+    AUDIT_HEAD_ACCOUNT = 'audit_log_head'
 
     @staticmethod
     def generate_key() -> bytes:
@@ -45,15 +45,39 @@ class KeyManager:
         return KeyManager.retrieve_key() is not None
 
     @staticmethod
-    def ensure_key() -> bytes:
-        """Gets existing key or generates and stores a new one."""
+    def store_audit_head(value: str, account: str = AUDIT_HEAD_ACCOUNT) -> bool:
+        """Pin the newest audit-chain head in the OS credential store."""
+        try:
+            keyring.set_password(KeyManager.SERVICE_NAME, account, value)
+            return keyring.get_password(KeyManager.SERVICE_NAME, account) == value
+        except Exception as exc:
+            logging.error("Could not update protected audit-chain anchor: %s", exc)
+            return False
+
+    @staticmethod
+    def retrieve_audit_head(account: str = AUDIT_HEAD_ACCOUNT) -> Optional[str]:
+        try:
+            return keyring.get_password(KeyManager.SERVICE_NAME, account)
+        except Exception as exc:
+            logging.error("Could not read protected audit-chain anchor: %s", exc)
+            return None
+
+    @staticmethod
+    def ensure_key(data_exists: bool = False) -> bytes:
+        """Load the existing key, or safely provision one for a new installation."""
         key = KeyManager.retrieve_key()
         if key:
             return key
-        
-        logging.info("No master key found. Generating new master key.")
+
+        if data_exists:
+            raise RuntimeError(
+                "The encryption key is unavailable but encrypted data already exists. "
+                "Restore the original key from Windows Credential Manager before continuing."
+            )
+
         new_key = KeyManager.generate_key()
-        KeyManager.store_key(new_key)
+        if not KeyManager.store_key(new_key) or KeyManager.retrieve_key() != new_key:
+            raise RuntimeError("Could not securely store and verify the encryption key.")
         return new_key
 
     @staticmethod
@@ -62,7 +86,6 @@ class KeyManager:
         Generates a new key. The DB instance must handle re-encryption.
         (Implementation depends on DB capabilities).
         """
-        new_key = KeyManager.generate_key()
-        # Storage re-encryption would happen here before saving the new key
-        KeyManager.store_key(new_key)
-        return new_key
+        raise NotImplementedError(
+            "Key rotation is unavailable until database and vault re-encryption is implemented."
+        )

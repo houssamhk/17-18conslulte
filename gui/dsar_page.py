@@ -5,13 +5,14 @@ from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
 from PyQt6.QtCore import Qt
 from gui.theme import COLORS
 from engine.dsar_manager import DSARManager
+from .dialog_utils import configure_dialog_size
 
 class CreateDSARDialog(QDialog):
     def __init__(self, db, parent=None):
         super().__init__(parent)
         self.db = db
         self.setWindowTitle("إنشاء طلب DSAR جديد")
-        self.setFixedSize(400, 300)
+        configure_dialog_size(self, preferred=(600, 480), minimum=(420, 340))
         self.setStyleSheet(f"background-color: {COLORS['BG_MAIN']}; color: {COLORS['TEXT_PRIMARY']};")
         
         layout = QVBoxLayout(self)

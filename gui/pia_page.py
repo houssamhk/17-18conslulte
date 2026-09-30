@@ -1,6 +1,6 @@
 import json
 from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton, 
-                             QTableWidget, QTableWidgetItem, QHeaderView, QLabel)
+                             QTableWidget, QTableWidgetItem, QHeaderView, QLabel, QWizard)
 from PyQt6.QtCore import Qt
 from storage.secure_db import SecureDatabase
 from gui.theme import COLORS

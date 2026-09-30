@@ -1,5 +1,16 @@
 import json
 import logging
+import os
+import sqlite3
+import uuid
+import hashlib
+import hmac
+import base64
+import secrets
+import struct
+import time
+import re
+import shutil
 import bcrypt
 from typing import List, Dict, Optional, Tuple
 
@@ -11,23 +22,52 @@ except ImportError:
     _has_sqlcipher = False
 
 from .key_manager import KeyManager
-from cryptography.fernet import Fernet
+from .password_policy import password_is_valid
+from cryptography.fernet import Fernet, InvalidToken
+
+AUDIT_HASH_VERSION = "hmac-sha256-v2"
+AUDIT_HASH_PREFIX = AUDIT_HASH_VERSION + ":"
 
 class SecureDatabase:
     """AES-256 Encrypted SQLite Database for Audit Logs, Settings, Users, and Keywords."""
-    
-    def __init__(self, db_path: str = 'alg_pii_engine.db'):
-        self.db_path = db_path
+
+    def __init__(self, db_path: str = None):
+        self.db_path = os.path.abspath(db_path or self._default_database_path())
+        db_identity = hashlib.sha256(os.path.normcase(self.db_path).encode("utf-8")).hexdigest()[:24]
+        self._audit_anchor_account = f"{KeyManager.AUDIT_HEAD_ACCOUNT}_{db_identity}"
         self._use_sqlcipher = _has_sqlcipher
         self.conn = None
         self.fernet = None
+        self._integrity_key = None
         self._connect()
         self._init_schema()
 
+    @staticmethod
+    def _default_database_path() -> str:
+        legacy_path = os.path.abspath('alg_pii_engine.db')
+        if os.path.isfile(legacy_path):
+            return legacy_path
+        if os.name == 'nt':
+            base = os.environ.get('LOCALAPPDATA') or os.path.expanduser('~')
+        else:
+            base = os.environ.get('XDG_DATA_HOME') or os.path.join(os.path.expanduser('~'), '.local', 'share')
+        data_dir = os.path.join(base, 'AlgPIIEngine')
+        os.makedirs(data_dir, exist_ok=True)
+        return os.path.join(data_dir, 'alg_pii_engine.db')
+
     def _connect(self):
-        key = KeyManager.ensure_key()
-        self.conn = sqlite.connect(self.db_path, check_same_thread=False)
-        
+        if not _has_sqlcipher:
+            raise RuntimeError(
+                "SQLCipher is required to open the data store. Install the project "
+                "dependencies; refusing to open sensitive data with plain SQLite."
+            )
+        data_exists = os.path.isfile(self.db_path) and os.path.getsize(self.db_path) > 0
+        key = KeyManager.ensure_key(data_exists=data_exists)
+        self._integrity_key = key
+        if data_exists:
+            self._migrate_plaintext_database_if_needed(key)
+        self.conn = sqlite.connect(self.db_path, timeout=5.0)
+
         if self._use_sqlcipher:
             # PRAGMA key must be the first operation
             key_hex = key.hex()
@@ -38,8 +78,101 @@ class SecureDatabase:
             except sqlite.DatabaseError:
                 logging.error("Database encryption key is invalid or database is corrupt.")
                 raise ValueError("Invalid Database Key")
-        else:
-            self.fernet = Fernet(key)
+        self.conn.execute("PRAGMA foreign_keys = ON")
+        self.conn.execute("PRAGMA journal_mode = WAL")
+
+        self.fernet = Fernet(key)
+
+    def _migrate_plaintext_database_if_needed(self, key: bytes):
+        """Encrypt an older plain SQLite store while preserving a verifiable backup."""
+        with open(self.db_path, 'rb') as source:
+            is_plain_sqlite = source.read(16) == b"SQLite format 3\x00"
+        if not is_plain_sqlite:
+            probe = sqlite.connect(self.db_path)
+            try:
+                probe.execute(f"PRAGMA key = '{key.hex()}'")
+                probe.execute("SELECT count(*) FROM sqlite_master").fetchone()
+                return
+            except sqlite.DatabaseError:
+                pass
+            finally:
+                probe.close()
+
+        # Work from a copy because old releases shipped a recovery-code foreign
+        # key to a non-unique username column; SQLite's iterdump rejects it.
+        legacy_copy_path = f"{self.db_path}.{uuid.uuid4().hex}.legacy-copy"
+        shutil.copyfile(self.db_path, legacy_copy_path)
+        legacy = sqlite3.connect(legacy_copy_path)
+        try:
+            legacy.execute("SELECT count(*) FROM sqlite_master").fetchone()
+            try:
+                legacy.execute("PRAGMA foreign_key_check").fetchall()
+            except sqlite3.OperationalError as exc:
+                if "foreign key mismatch" not in str(exc).lower():
+                    raise
+                schema_row = legacy.execute(
+                    "SELECT sql FROM sqlite_master WHERE type='table' AND name='totp_recovery_codes'"
+                ).fetchone()
+                if not schema_row or not schema_row[0]:
+                    raise
+                repaired_sql, replacements = re.subn(
+                    r"\s+REFERENCES\s+users\s*\(\s*username\s*\)"
+                    r"(?:\s+ON\s+(?:DELETE|UPDATE)\s+(?:CASCADE|RESTRICT|SET\s+NULL|NO\s+ACTION))?",
+                    "",
+                    schema_row[0],
+                    count=1,
+                    flags=re.IGNORECASE,
+                )
+                if not replacements:
+                    raise
+                legacy.execute("PRAGMA writable_schema=ON")
+                legacy.execute(
+                    "UPDATE sqlite_master SET sql=? WHERE type='table' AND name='totp_recovery_codes'",
+                    (repaired_sql,),
+                )
+                version = legacy.execute("PRAGMA schema_version").fetchone()[0]
+                legacy.execute(f"PRAGMA schema_version={int(version) + 1}")
+                legacy.execute("PRAGMA writable_schema=OFF")
+                legacy.commit()
+                legacy.close()
+                legacy = sqlite3.connect(legacy_copy_path)
+            dump = "\n".join(legacy.iterdump())
+        except sqlite3.DatabaseError as exc:
+            legacy.close()
+            raise ValueError("Database is neither readable SQLite nor accessible with its SQLCipher key") from exc
+        finally:
+            try:
+                legacy.close()
+            except Exception:
+                pass
+            if os.path.exists(legacy_copy_path):
+                os.remove(legacy_copy_path)
+
+        temp_path = f"{self.db_path}.{uuid.uuid4().hex}.encrypted"
+        backup_path = f"{self.db_path}.legacy-backup.fernet"
+        if os.path.exists(backup_path):
+            backup_path = f"{backup_path}.{uuid.uuid4().hex}"
+        encrypted = sqlite.connect(temp_path)
+        try:
+            encrypted.execute(f"PRAGMA key = '{key.hex()}'")
+            encrypted.execute("SELECT count(*) FROM sqlite_master").fetchone()
+            encrypted.executescript(dump)
+            encrypted.commit()
+        except Exception:
+            encrypted.close()
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+            raise
+        encrypted.close()
+        with open(self.db_path, 'rb') as source:
+            encrypted_backup = Fernet(key).encrypt(source.read())
+        with open(backup_path, 'xb') as backup:
+            backup.write(encrypted_backup)
+        try:
+            os.replace(temp_path, self.db_path)
+        except Exception:
+            os.remove(backup_path)
+            raise
 
     def _encrypt_val(self, val: str) -> str:
         if self._use_sqlcipher or not self.fernet or not val:
@@ -47,16 +180,18 @@ class SecureDatabase:
         return self.fernet.encrypt(val.encode()).decode()
 
     def _decrypt_val(self, val: str) -> str:
-        if self._use_sqlcipher or not self.fernet or not val:
+        if not self.fernet or not val:
             return val
         try:
             return self.fernet.decrypt(val.encode()).decode()
-        except Exception:
-            return val # Might not be encrypted
+        except InvalidToken:
+            if val.startswith('gAAAA'):
+                raise ValueError("Encrypted database field failed authentication")
+            return val
 
     def _init_schema(self):
         c = self.conn.cursor()
-        
+
         # Scans
         c.execute('''CREATE TABLE IF NOT EXISTS scan_history
                      (id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -72,12 +207,13 @@ class SecureDatabase:
                       label_override_by TEXT,
                       label_override_reason TEXT,
                       department TEXT)''')
-                      
+
         try:
             c.execute("ALTER TABLE scan_history ADD COLUMN department TEXT")
-        except:
-            pass
-            
+        except sqlite.OperationalError as exc:
+            if "duplicate column name" not in str(exc).lower():
+                raise
+
         # Labeling Policies
         c.execute('''CREATE TABLE IF NOT EXISTS labeling_policies
                      (id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -88,7 +224,7 @@ class SecureDatabase:
                       required_entity_types TEXT,
                       description_ar TEXT,
                       description_en TEXT)''')
-                      
+
         # Regulatory Mappings
         c.execute('''CREATE TABLE IF NOT EXISTS regulatory_mappings
                      (id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -101,23 +237,60 @@ class SecureDatabase:
                       penalty_description_ar TEXT,
                       applicable_sectors TEXT,
                       is_active BOOLEAN DEFAULT 1)''')
-                      
+
         # Settings
         c.execute('''CREATE TABLE IF NOT EXISTS settings
                      (key TEXT PRIMARY KEY, value TEXT)''')
-                     
+
         # Users
         c.execute('''CREATE TABLE IF NOT EXISTS users
                      (id INTEGER PRIMARY KEY AUTOINCREMENT,
                       username TEXT UNIQUE,
                       password_hash TEXT,
                       role TEXT)''')
-                      
+
+        c.execute('''CREATE TABLE IF NOT EXISTS totp_recovery_codes
+                     (username TEXT NOT NULL,
+                      code_hash TEXT NOT NULL,
+                      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                      PRIMARY KEY(username, code_hash))''')
+
+        # A legacy users table may not have a UNIQUE index on username, which
+        # makes SQLite reject deletes against a foreign key to that column.
+        # Recovery hashes are scoped by username in the database API; rebuild
+        # older tables without the invalid FK while preserving existing hashes.
+        recovery_fks = c.execute("PRAGMA foreign_key_list(totp_recovery_codes)").fetchall()
+        username_is_unique = any(
+            index[2] and [col[2] for col in c.execute(f"PRAGMA index_info({index[1]})").fetchall()] == ["username"]
+            for index in c.execute("PRAGMA index_list(users)").fetchall()
+        )
+        if recovery_fks and not username_is_unique:
+            saved_recovery_codes = c.execute(
+                "SELECT username, code_hash, created_at FROM totp_recovery_codes"
+            ).fetchall()
+            c.execute("DROP TABLE totp_recovery_codes")
+            c.execute('''CREATE TABLE totp_recovery_codes
+                         (username TEXT NOT NULL, code_hash TEXT NOT NULL,
+                          created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                          PRIMARY KEY(username, code_hash))''')
+            c.executemany(
+                "INSERT INTO totp_recovery_codes (username, code_hash, created_at) VALUES (?, ?, ?)",
+                saved_recovery_codes,
+            )
+
+        c.execute('''CREATE TABLE IF NOT EXISTS login_attempts
+                     (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                      username_key TEXT NOT NULL,
+                      attempted_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                      succeeded BOOLEAN NOT NULL DEFAULT 0)''')
+        c.execute('''CREATE INDEX IF NOT EXISTS idx_login_attempts_user_time
+                     ON login_attempts(username_key, attempted_at)''')
+
         # Custom Keywords
         c.execute('''CREATE TABLE IF NOT EXISTS custom_keywords
                      (id INTEGER PRIMARY KEY AUTOINCREMENT,
                       keyword TEXT UNIQUE)''')
-                      
+
         # Audit Log
         c.execute('''CREATE TABLE IF NOT EXISTS audit_log
                      (id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -125,7 +298,7 @@ class SecureDatabase:
                       username TEXT,
                       action TEXT,
                       details TEXT)''')
-                      
+
         # Document Fingerprints
         c.execute('''CREATE TABLE IF NOT EXISTS document_fingerprints
                      (id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -134,7 +307,7 @@ class SecureDatabase:
                       fingerprint INTEGER,
                       created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                       FOREIGN KEY(scan_id) REFERENCES scan_history(id))''')
-                      
+
         # PII Clusters
         c.execute('''CREATE TABLE IF NOT EXISTS pii_clusters
                      (id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -143,7 +316,7 @@ class SecureDatabase:
                       risk_multiplier REAL,
                       entity_types TEXT,
                       FOREIGN KEY(scan_id) REFERENCES scan_history(id))''')
-                      
+
         # Compliance Policies
         c.execute('''CREATE TABLE IF NOT EXISTS compliance_policies
                      (id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -183,20 +356,20 @@ class SecureDatabase:
                       resolution_notes TEXT,
                       created_by TEXT,
                       created_at DATETIME DEFAULT CURRENT_TIMESTAMP)''')
-                      
+
         c.execute('''CREATE TABLE IF NOT EXISTS incident_notes
                      (id INTEGER PRIMARY KEY AUTOINCREMENT,
                       incident_id INTEGER REFERENCES incidents(id),
                       note_text TEXT,
                       author TEXT,
                       created_at DATETIME DEFAULT CURRENT_TIMESTAMP)''')
-                      
+
         c.execute('''CREATE TABLE IF NOT EXISTS incident_evidence
                      (id INTEGER PRIMARY KEY AUTOINCREMENT,
                       incident_id INTEGER REFERENCES incidents(id),
                       scan_id INTEGER REFERENCES scan_history(id),
                       description TEXT)''')
-                      
+
         # Scheduled Automated Scanning
         c.execute('''CREATE TABLE IF NOT EXISTS scheduled_tasks
                      (id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -209,8 +382,13 @@ class SecureDatabase:
                       last_run_files_count INTEGER,
                       last_run_violations INTEGER,
                       created_by TEXT,
+                      department TEXT,
+                      run_started_at DATETIME,
+                      run_owner_pid INTEGER,
+                      last_run_status TEXT,
+                      last_run_error_count INTEGER DEFAULT 0,
                       created_at DATETIME DEFAULT CURRENT_TIMESTAMP)''')
-                      
+
         c.execute('''CREATE TABLE IF NOT EXISTS scan_manifest
                      (id INTEGER PRIMARY KEY AUTOINCREMENT,
                       task_id INTEGER REFERENCES scheduled_tasks(id),
@@ -218,7 +396,7 @@ class SecureDatabase:
                       file_hash TEXT,
                       last_modified DATETIME,
                       last_scanned DATETIME)''')
-                      
+
         # Data Retention Policies
         c.execute('''CREATE TABLE IF NOT EXISTS retention_policies
                      (id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -226,7 +404,7 @@ class SecureDatabase:
                       retention_days INTEGER NOT NULL,
                       action TEXT DEFAULT 'DELETE',
                       is_active BOOLEAN DEFAULT 1)''')
-                      
+
         c.execute('''CREATE TABLE IF NOT EXISTS retention_log
                      (id INTEGER PRIMARY KEY AUTOINCREMENT,
                       table_name TEXT,
@@ -243,7 +421,7 @@ class SecureDatabase:
                       created_at DATETIME DEFAULT CURRENT_TIMESTAMP)''')
 
         # ===== PHASE 3: ADVANCED INTELLIGENCE TABLES =====
-        
+
         # Feature #20 & #35: Cross-Document Entity Linking & Contextual Classification
         c.execute('''CREATE TABLE IF NOT EXISTS entity_index
                      (id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -257,16 +435,17 @@ class SecureDatabase:
                       context_label TEXT,
                       context_keywords TEXT,
                       indexed_at DATETIME DEFAULT CURRENT_TIMESTAMP)''')
-        
+
         try:
             c.execute("ALTER TABLE entity_index ADD COLUMN context_label TEXT")
             c.execute("ALTER TABLE entity_index ADD COLUMN context_keywords TEXT")
-        except:
-            pass
-            
+        except sqlite.OperationalError as exc:
+            if "duplicate column name" not in str(exc).lower():
+                raise
+
         c.execute('CREATE INDEX IF NOT EXISTS idx_entity_hash ON entity_index(entity_hash)')
         c.execute('CREATE INDEX IF NOT EXISTS idx_entity_type ON entity_index(entity_type)')
-        
+
         # Feature #11: Multi-Department Isolation
         c.execute('''CREATE TABLE IF NOT EXISTS departments
                      (id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -277,7 +456,7 @@ class SecureDatabase:
                      (user_id INTEGER REFERENCES users(id),
                       department_id INTEGER REFERENCES departments(id),
                       PRIMARY KEY (user_id, department_id))''')
-                      
+
         # Feature #4: DSAR Manager
         c.execute('''CREATE TABLE IF NOT EXISTS dsar_requests
                      (id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -308,7 +487,7 @@ class SecureDatabase:
                       is_acknowledged BOOLEAN DEFAULT 0,
                       detected_at DATETIME DEFAULT CURRENT_TIMESTAMP)''')
         # ===== PHASE 4: ENTERPRISE ECOSYSTEM TABLES =====
-        
+
         # Feature #13: PIA Wizard
         c.execute('''CREATE TABLE IF NOT EXISTS pia_assessments
                      (id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -322,7 +501,7 @@ class SecureDatabase:
                       status TEXT DEFAULT 'DRAFT',
                       created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                       updated_at DATETIME DEFAULT CURRENT_TIMESTAMP)''')
-                      
+
         # Feature #14: Consent Registry
         c.execute('''CREATE TABLE IF NOT EXISTS consent_registry
                      (id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -334,7 +513,7 @@ class SecureDatabase:
                       expires_at DATETIME,
                       created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                       updated_at DATETIME DEFAULT CURRENT_TIMESTAMP)''')
-                      
+
         # Feature #24: Secure Document Vault
         c.execute('''CREATE TABLE IF NOT EXISTS document_vault
                      (id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -379,7 +558,7 @@ class SecureDatabase:
                       correct_option INTEGER,
                       difficulty TEXT,
                       category TEXT)''')
-                      
+
         c.execute('''CREATE TABLE IF NOT EXISTS training_results
                      (id INTEGER PRIMARY KEY AUTOINCREMENT,
                       username TEXT,
@@ -399,17 +578,71 @@ class SecureDatabase:
                       created_by TEXT,
                       created_at DATETIME DEFAULT CURRENT_TIMESTAMP)''')
 
+        # Older installations may already have these tables, so CREATE TABLE
+        # IF NOT EXISTS alone does not bring their columns up to date.
+        legacy_columns = {
+            "users": {
+                "totp_secret": "TEXT",
+                "totp_enabled": "BOOLEAN DEFAULT 0",
+            },
+            "scan_history": {
+                "timestamp": "DATETIME",
+                "document_name": "TEXT",
+                "total_entities": "INTEGER DEFAULT 0",
+                "risk_level": "TEXT DEFAULT 'LOW'",
+                "strategy_used": "TEXT",
+                "summary_json": "TEXT",
+                "sensitivity_label": "TEXT DEFAULT 'UNCLASSIFIED'",
+                "ocr_used": "BOOLEAN DEFAULT 0",
+                "duplicates_found": "INTEGER DEFAULT 0",
+                "label_override_by": "TEXT",
+                "label_override_reason": "TEXT",
+                "department": "TEXT",
+            },
+            "audit_log": {
+                "timestamp": "DATETIME",
+                "username": "TEXT",
+                "action": "TEXT",
+                "details": "TEXT",
+                "previous_hash": "TEXT",
+                "entry_hash": "TEXT",
+                "hash_version": "TEXT",
+            },
+            "scheduled_tasks": {
+                "department": "TEXT",
+                "run_started_at": "DATETIME",
+                "run_owner_pid": "INTEGER",
+                "last_run_status": "TEXT",
+                "last_run_error_count": "INTEGER DEFAULT 0",
+            },
+        }
+        for table_name, columns in legacy_columns.items():
+            existing = {row[1] for row in c.execute(f"PRAGMA table_info({table_name})").fetchall()}
+            for column_name, column_type in columns.items():
+                if column_name not in existing:
+                    c.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_type}")
+            if "timestamp" in columns and "timestamp" not in existing:
+                c.execute(f"UPDATE {table_name} SET timestamp=CURRENT_TIMESTAMP WHERE timestamp IS NULL")
+
         self.conn.commit()
-        
-        # Check if admin exists
-        c.execute("SELECT COUNT(*) FROM users")
-        if c.fetchone()[0] == 0:
-            # Create default admin (password: admin)
-            self.create_user("admin", "admin", "admin")
+        self._initialize_audit_chain()
+        self._initialize_audit_head_anchor()
+
+        # Remove the historical bootstrap credential from upgraded installations.
+        c.execute("SELECT username, password_hash FROM users WHERE username='admin'")
+        legacy_admin = c.fetchone()
+        if legacy_admin:
+            try:
+                if bcrypt.checkpw(b"admin", legacy_admin[1].encode("utf-8")):
+                    c.execute("DELETE FROM user_departments WHERE user_id=(SELECT id FROM users WHERE username='admin')")
+                    c.execute("DELETE FROM users WHERE username='admin'")
+                    self.conn.commit()
+            except (ValueError, TypeError):
+                pass
 
         # Initialize Default Labeling Policies
         self._init_default_labeling_policies()
-        
+
         # Initialize Default Regulatory Mappings
         self._init_default_regulatory_mappings()
 
@@ -427,8 +660,8 @@ class SecureDatabase:
                 ("CCP", "التجارة الإلكترونية", "18-05", "المادة 11", "سرية البيانات البنكية", "يمنع كشف أو تسريب بيانات الدفع والحسابات.", "الحبس ومصادرة المعدات.", '["banking", "ecommerce"]'),
                 ("IBAN", "التجارة الإلكترونية", "18-05", "المادة 11", "سرية البيانات البنكية", "يمنع كشف أو تسريب بيانات الدفع والحسابات.", "الحبس ومصادرة المعدات.", '["banking", "ecommerce"]')
             ]
-            c.executemany('''INSERT INTO regulatory_mappings 
-                             (entity_type, law_name, law_number, article_number, article_title_ar, article_summary_ar, penalty_description_ar, applicable_sectors) 
+            c.executemany('''INSERT INTO regulatory_mappings
+                             (entity_type, law_name, law_number, article_number, article_title_ar, article_summary_ar, penalty_description_ar, applicable_sectors)
                              VALUES (?, ?, ?, ?, ?, ?, ?, ?)''', mappings)
             self.conn.commit()
 
@@ -443,50 +676,295 @@ class SecureDatabase:
                 ("HIGHLY_CONFIDENTIAL", "#a00000", 41, 100, "[]", "سري جداً", "Highly Confidential"),
                 ("TOP_SECRET", "#533483", 101, 999999, "[]", "سري للغاية", "Top Secret")
             ]
-            c.executemany('''INSERT INTO labeling_policies 
-                             (label_name, label_color, min_score, max_score, required_entity_types, description_ar, description_en) 
+            c.executemany('''INSERT INTO labeling_policies
+                             (label_name, label_color, min_score, max_score, required_entity_types, description_ar, description_en)
                              VALUES (?, ?, ?, ?, ?, ?, ?)''', policies)
             self.conn.commit()
 
     # --- USER MANAGEMENT ---
-    
+
     def create_user(self, username: str, password: str, role: str) -> bool:
         """Creates a new user with bcrypt password hash."""
+        password_bytes = password.encode('utf-8')
+        if not username.strip() or len(username.strip()) > 128 or not password_is_valid(password) or role not in {"admin", "user"}:
+            return False
         salt = bcrypt.gensalt()
         hashed = bcrypt.hashpw(password.encode('utf-8'), salt).decode('utf-8')
         try:
             c = self.conn.cursor()
-            c.execute("INSERT INTO users (username, password_hash, role) VALUES (?, ?, ?)", 
+            c.execute("INSERT INTO users (username, password_hash, role) VALUES (?, ?, ?)",
                       (username, hashed, role))
             self.conn.commit()
             return True
         except sqlite.IntegrityError:
             return False # Username exists
-            
+
+    def change_user_password(self, username: str, current_password: str, new_password: str) -> bool:
+        """Change a user's password only after verifying the current password."""
+        password_bytes = (new_password or "").encode("utf-8")
+        if not username or not password_is_valid(new_password):
+            return False
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT password_hash FROM users WHERE username=?", (username,))
+        row = cursor.fetchone()
+        if not row:
+            return False
+        try:
+            if not bcrypt.checkpw((current_password or "").encode("utf-8"), row[0].encode("utf-8")):
+                return False
+            password_hash = bcrypt.hashpw(password_bytes, bcrypt.gensalt()).decode("utf-8")
+            cursor.execute("UPDATE users SET password_hash=? WHERE username=?", (password_hash, username))
+            self.conn.commit()
+            return cursor.rowcount == 1
+        except (ValueError, TypeError):
+            return False
+
+    @staticmethod
+    def generate_totp_secret() -> str:
+        return base64.b32encode(secrets.token_bytes(20)).decode("ascii").rstrip("=")
+
+    @staticmethod
+    def verify_totp_secret(secret: str, code: str, at_time: Optional[int] = None) -> bool:
+        """Verify a six-digit RFC 6238 TOTP with a one-step clock-skew window."""
+        code = (code or "").strip().replace(" ", "")
+        if len(code) != 6 or not code.isdigit() or not secret:
+            return False
+        try:
+            padded = secret + "=" * ((8 - len(secret) % 8) % 8)
+            key = base64.b32decode(padded, casefold=True)
+        except (ValueError, TypeError):
+            return False
+        timestamp = int(time.time() if at_time is None else at_time)
+        counter = timestamp // 30
+        for step in (counter - 1, counter, counter + 1):
+            digest = hmac.new(key, struct.pack(">Q", step), hashlib.sha1).digest()
+            offset = digest[-1] & 0x0F
+            number = (struct.unpack(">I", digest[offset:offset + 4])[0] & 0x7FFFFFFF) % 1_000_000
+            if hmac.compare_digest(f"{number:06d}", code):
+                return True
+        return False
+
+    @staticmethod
+    def _check_user_password(cursor, username: str, password: str) -> bool:
+        cursor.execute("SELECT password_hash FROM users WHERE username=?", (username,))
+        row = cursor.fetchone()
+        if not row:
+            return False
+        try:
+            return bcrypt.checkpw((password or "").encode("utf-8"), row[0].encode("utf-8"))
+        except (ValueError, TypeError):
+            return False
+
+    def user_totp_enabled(self, username: str) -> bool:
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT totp_enabled FROM users WHERE username=?", (username,))
+        row = cursor.fetchone()
+        return bool(row and row[0])
+
+    def begin_totp_enrollment(self, username: str, current_password: str) -> Optional[str]:
+        cursor = self.conn.cursor()
+        if not self._check_user_password(cursor, username, current_password):
+            return None
+        cursor.execute("SELECT totp_enabled FROM users WHERE username=?", (username,))
+        row = cursor.fetchone()
+        if not row or row[0]:
+            return None
+        return self.generate_totp_secret()
+
+    def enable_totp(self, username: str, current_password: str, secret: str, code: str) -> Optional[List[str]]:
+        cursor = self.conn.cursor()
+        if not self._check_user_password(cursor, username, current_password):
+            return False
+        if not self.verify_totp_secret(secret, code):
+            return False
+        recovery_codes = [secrets.token_hex(8).upper() for _ in range(8)]
+        cursor.execute(
+            "UPDATE users SET totp_secret=?, totp_enabled=1 WHERE username=? AND COALESCE(totp_enabled, 0)=0",
+            (secret, username),
+        )
+        if cursor.rowcount != 1:
+            self.conn.rollback()
+            return False
+        cursor.execute("DELETE FROM totp_recovery_codes WHERE username=?", (username,))
+        cursor.executemany(
+            "INSERT INTO totp_recovery_codes (username, code_hash) VALUES (?, ?)",
+            [(username, hashlib.sha256(code.encode("ascii")).hexdigest()) for code in recovery_codes],
+        )
+        self.conn.commit()
+        return recovery_codes
+
+    def complete_totp_auth(self, username: str, code: str) -> bool:
+        username_key = (username or "").strip().casefold()
+        if not username_key or self.get_login_lock_remaining(username_key) > 0:
+            return False
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT totp_secret, totp_enabled FROM users WHERE username=?", (username,))
+        row = cursor.fetchone()
+        accepted = bool(row and row[1] and self.verify_totp_secret(row[0], code))
+        if row and row[1] and not accepted:
+            normalized_code = (code or "").strip().replace("-", "").replace(" ", "").upper()
+            if len(normalized_code) == 16:
+                code_hash = hashlib.sha256(normalized_code.encode("ascii", errors="ignore")).hexdigest()
+                cursor.execute(
+                    "DELETE FROM totp_recovery_codes WHERE username=? AND code_hash=?",
+                    (username, code_hash),
+                )
+                accepted = cursor.rowcount == 1
+        if accepted:
+            cursor.execute("DELETE FROM login_attempts WHERE username_key=?", (username_key,))
+            self.conn.commit()
+            return True
+        self._record_login_failure(username_key, "Second-factor verification failed; submitted code was not stored.")
+        return False
+
+    def disable_totp(self, username: str, current_password: str, code: str) -> bool:
+        cursor = self.conn.cursor()
+        if not self._check_user_password(cursor, username, current_password):
+            return False
+        cursor.execute("SELECT totp_secret, totp_enabled FROM users WHERE username=?", (username,))
+        row = cursor.fetchone()
+        if not row or not row[1] or not self.verify_totp_secret(row[0], code):
+            return False
+        cursor.execute("UPDATE users SET totp_secret=NULL, totp_enabled=0 WHERE username=?", (username,))
+        updated = cursor.rowcount == 1
+        cursor.execute("DELETE FROM totp_recovery_codes WHERE username=?", (username,))
+        self.conn.commit()
+        return updated
+
+    def admin_reset_totp(self, username: str) -> bool:
+        cursor = self.conn.cursor()
+        cursor.execute("UPDATE users SET totp_secret=NULL, totp_enabled=0 WHERE username=? AND COALESCE(totp_enabled, 0)=1", (username,))
+        updated = cursor.rowcount == 1
+        cursor.execute("DELETE FROM totp_recovery_codes WHERE username=?", (username,))
+        self.conn.commit()
+        return updated
+
+    def get_totp_recovery_count(self, username: str) -> int:
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM totp_recovery_codes WHERE username=?", (username,))
+        return int(cursor.fetchone()[0])
+
+    def rotate_totp_recovery_codes(self, username: str, current_password: str, code: str) -> Optional[List[str]]:
+        cursor = self.conn.cursor()
+        if not self._check_user_password(cursor, username, current_password):
+            return None
+        cursor.execute("SELECT totp_secret, totp_enabled FROM users WHERE username=?", (username,))
+        row = cursor.fetchone()
+        if not row or not row[1] or not self.verify_totp_secret(row[0], code):
+            return None
+        recovery_codes = [secrets.token_hex(8).upper() for _ in range(8)]
+        cursor.execute("DELETE FROM totp_recovery_codes WHERE username=?", (username,))
+        cursor.executemany(
+            "INSERT INTO totp_recovery_codes (username, code_hash) VALUES (?, ?)",
+            [(username, hashlib.sha256(recovery_code.encode("ascii")).hexdigest()) for recovery_code in recovery_codes],
+        )
+        self.conn.commit()
+        return recovery_codes
+
+    def _record_login_failure(self, username_key: str, details: str):
+        self.conn.execute(
+            "INSERT INTO login_attempts (username_key, succeeded) VALUES (?, 0)",
+            (username_key[:128],),
+        )
+        self.conn.commit()
+        self.log_audit(username_key[:128], "LOGIN_FAILURE", details)
+
     def authenticate_user(self, username: str, password: str) -> Tuple[bool, Optional[str], Optional[str]]:
         """Authenticates user and returns (success, role, department_name)."""
+        username_key = (username or "").strip().casefold()
+        if not username_key or len(username_key) > 128:
+            return False, None, None
+
+        self.conn.execute(
+            "DELETE FROM login_attempts WHERE attempted_at < datetime('now', '-30 days')"
+        )
+        if self.get_login_lock_remaining(username_key) > 0:
+            return False, None, None
+
         c = self.conn.cursor()
         c.execute("""
-            SELECT u.password_hash, u.role, d.name 
+            SELECT u.password_hash, u.role, d.name, COALESCE(u.totp_enabled, 0)
             FROM users u
-            LEFT JOIN user_departments ud ON u.id = ud.user_id
-            LEFT JOIN departments d ON ud.department_id = d.id
+            LEFT JOIN departments d ON d.id=(
+                SELECT ud.department_id FROM user_departments ud
+                WHERE ud.user_id=u.id ORDER BY ud.department_id LIMIT 1
+            )
             WHERE u.username=?
         """, (username,))
         row = c.fetchone()
-        if not row:
-            return False, None, None
-            
-        hashed_pw, role, dept = row
-        if bcrypt.checkpw(password.encode('utf-8'), hashed_pw.encode('utf-8')):
+        authenticated = False
+        role = dept = None
+        try:
+            if row:
+                hashed_pw, role, dept, totp_enabled = row
+                authenticated = bcrypt.checkpw(password.encode('utf-8'), hashed_pw.encode('utf-8'))
+            else:
+                # Perform comparable password-hash work for unknown usernames.
+                bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt())
+        except (ValueError, TypeError):
+            authenticated = False
+
+        if authenticated:
+            if not bool(totp_enabled if row else False):
+                self.conn.execute("DELETE FROM login_attempts WHERE username_key=?", (username_key,))
+                self.conn.commit()
             return True, role, dept
+
+        self._record_login_failure(username_key, "Authentication failed; submitted password was not stored.")
         return False, None, None
-        
+
+    def get_login_lock_remaining(self, username: str) -> int:
+        """Seconds remaining in a 15-minute lock after five failures in the window."""
+        username_key = (username or "").strip().casefold()
+        cursor = self.conn.cursor()
+        cursor.execute(
+            """SELECT COUNT(*), MIN(attempted_at)
+               FROM login_attempts
+               WHERE username_key=? AND succeeded=0
+                 AND attempted_at >= datetime('now', '-15 minutes')""",
+            (username_key,),
+        )
+        count, _ = cursor.fetchone()
+        if count < 5:
+            return 0
+        cursor.execute(
+            """SELECT MAX(0, CAST((julianday(datetime(MIN(attempted_at), '+15 minutes')) - julianday('now')) * 86400 + 0.999 AS INTEGER))
+               FROM login_attempts
+               WHERE username_key=? AND succeeded=0
+                 AND attempted_at >= datetime('now', '-15 minutes')""",
+            (username_key,),
+        )
+        return max(0, int(cursor.fetchone()[0] or 0))
+
+    def reset_login_attempts(self, username: str) -> bool:
+        """Allow an administrator to clear the temporary login lock."""
+        username_key = (username or "").strip().casefold()
+        if not username_key:
+            return False
+        if self.get_login_lock_remaining(username_key) <= 0:
+            return False
+        cursor = self.conn.cursor()
+        cursor.execute("DELETE FROM login_attempts WHERE username_key=?", (username_key,))
+        self.conn.commit()
+        return cursor.rowcount > 0
+
+    def has_users(self) -> bool:
+        c = self.conn.cursor()
+        c.execute("SELECT 1 FROM users LIMIT 1")
+        return c.fetchone() is not None
+
     def get_users(self) -> List[Dict]:
         """Returns list of users (excluding password hashes)."""
         c = self.conn.cursor()
-        c.execute("SELECT username, role FROM users")
-        return [{"username": r[0], "role": r[1]} for r in c.fetchall()]
+        c.execute("""SELECT u.username, u.role, COALESCE(u.totp_enabled, 0),
+                          (SELECT d.name FROM user_departments ud JOIN departments d ON d.id=ud.department_id
+                           WHERE ud.user_id=u.id ORDER BY d.id LIMIT 1),
+                          (SELECT ud.department_id FROM user_departments ud WHERE ud.user_id=u.id ORDER BY ud.department_id LIMIT 1)
+                   FROM users u ORDER BY u.username""")
+        return [
+            {"username": r[0], "role": r[1], "totp_enabled": bool(r[2]), "department": r[3], "department_id": r[4]}
+            for r in c.fetchall()
+        ]
 
     def delete_user(self, username: str) -> bool:
         c = self.conn.cursor()
@@ -495,7 +973,7 @@ class SecureDatabase:
         return c.rowcount > 0
 
     # --- CUSTOM KEYWORDS ---
-    
+
     def add_custom_keyword(self, keyword: str) -> bool:
         try:
             c = self.conn.cursor()
@@ -504,13 +982,13 @@ class SecureDatabase:
             return True
         except sqlite.IntegrityError:
             return False
-            
+
     def remove_custom_keyword(self, keyword: str) -> bool:
         c = self.conn.cursor()
         c.execute("DELETE FROM custom_keywords WHERE keyword=?", (keyword.strip(),))
         self.conn.commit()
         return c.rowcount > 0
-        
+
     def get_custom_keywords(self) -> List[str]:
         c = self.conn.cursor()
         c.execute("SELECT keyword FROM custom_keywords")
@@ -522,10 +1000,10 @@ class SecureDatabase:
         c = self.conn.cursor()
         summary_str = self._encrypt_val(json.dumps(summary))
         doc_name_enc = self._encrypt_val(document_name)
-        
-        c.execute('''INSERT INTO scan_history 
-                     (document_name, total_entities, risk_level, strategy_used, summary_json, sensitivity_label, ocr_used, duplicates_found, department)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''', 
+
+        c.execute('''INSERT INTO scan_history
+                     (timestamp, document_name, total_entities, risk_level, strategy_used, summary_json, sensitivity_label, ocr_used, duplicates_found, department)
+                     VALUES (CURRENT_TIMESTAMP, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
                   (doc_name_enc, total_entities, risk_level, strategy, summary_str, sensitivity_label, ocr_used, duplicates_found, department))
         self.conn.commit()
         return c.lastrowid
@@ -537,15 +1015,35 @@ class SecureDatabase:
         else:
             c.execute("SELECT id, timestamp, document_name, total_entities, risk_level, strategy_used, summary_json, sensitivity_label, ocr_used, duplicates_found, department FROM scan_history ORDER BY timestamp DESC LIMIT ?", (limit,))
         rows = c.fetchall()
-        
+
         decrypted_rows = []
         for r in rows:
             doc_name = self._decrypt_val(r[2])
             summary_dict = self._decrypt_val(r[6])
             # (id, timestamp, doc_name, total_entities, risk_level, strategy, summary, sensitivity_label, ocr_used, duplicates_found, department)
             decrypted_rows.append((r[0], r[1], doc_name, r[3], r[4], r[5], summary_dict, r[7], r[8], r[9], r[10]))
-            
+
         return decrypted_rows
+
+    def update_scan_review(self, scan_id: int, total_entities: int, risk_level: str, summary: dict, sensitivity_label: str):
+        """Update a scan's final reviewed summary without storing raw entity values."""
+        c = self.conn.cursor()
+        summary_str = self._encrypt_val(json.dumps(summary))
+        c.execute(
+            "UPDATE scan_history SET total_entities=?, risk_level=?, summary_json=?, sensitivity_label=? WHERE id=?",
+            (total_entities, risk_level, summary_str, sensitivity_label, scan_id),
+        )
+        self.conn.commit()
+
+    def clear_indexed_entities_for_scan(self, scan_id: int):
+        c = self.conn.cursor()
+        c.execute("DELETE FROM entity_index WHERE scan_id=?", (scan_id,))
+        self.conn.commit()
+
+    def clear_clusters_for_scan(self, scan_id: int):
+        c = self.conn.cursor()
+        c.execute("DELETE FROM pii_clusters WHERE scan_id=?", (scan_id,))
+        self.conn.commit()
 
     def get_labeling_policies(self) -> List[Dict]:
         c = self.conn.cursor()
@@ -563,7 +1061,7 @@ class SecureDatabase:
             }
             for r in rows
         ]
-        
+
     def get_regulatory_mappings(self) -> List[Dict]:
         c = self.conn.cursor()
         c.execute("SELECT entity_type, law_name, law_number, article_number, article_title_ar, article_summary_ar, penalty_description_ar, applicable_sectors FROM regulatory_mappings WHERE is_active=1")
@@ -597,29 +1095,183 @@ class SecureDatabase:
         return default
 
     def close(self):
-        if self.conn:
-            self.conn.close()
+        conn, self.conn = self.conn, None
+        if conn is None:
+            return
+        try:
+            conn.execute("PRAGMA wal_checkpoint(FULL)")
+        except Exception:
+            logging.exception("Could not checkpoint database WAL before close")
+        finally:
+            conn.close()
 
     # --- AUDIT LOG ---
-    
+
     def log_audit(self, username: str, action: str, details: str = ""):
-        """Records a timestamped audit trail entry."""
+        """Append a timestamped audit entry linked to the prior entry hash."""
+        outer_transaction = self.conn.in_transaction
+        savepoint = "audit_append"
         try:
             c = self.conn.cursor()
-            c.execute("INSERT INTO audit_log (username, action, details) VALUES (?, ?, ?)",
-                      (username, action, details))
-            self.conn.commit()
+            if outer_transaction:
+                c.execute(f"SAVEPOINT {savepoint}")
+            else:
+                c.execute("BEGIN IMMEDIATE")
+            c.execute("SELECT entry_hash FROM audit_log ORDER BY id DESC LIMIT 1")
+            previous_hash = c.fetchone()
+            previous_hash = previous_hash[0] if previous_hash and previous_hash[0] else ""
+            c.execute("SELECT CURRENT_TIMESTAMP")
+            timestamp = c.fetchone()[0]
+            c.execute(
+                "INSERT INTO audit_log (timestamp, username, action, details, previous_hash, entry_hash, hash_version) VALUES (?, ?, ?, ?, ?, '', ?)",
+                (timestamp, username, action, details, previous_hash, AUDIT_HASH_VERSION),
+            )
+            entry_id = c.lastrowid
+            entry_hash = self._audit_entry_hash(entry_id, timestamp, username, action, details, previous_hash)
+            c.execute("UPDATE audit_log SET entry_hash=? WHERE id=?", (entry_hash, entry_id))
+            if outer_transaction:
+                c.execute(f"RELEASE SAVEPOINT {savepoint}")
+            else:
+                self.conn.commit()
+            if not KeyManager.store_audit_head(f"{entry_id}:{entry_hash}", self._audit_anchor_account):
+                logging.error("Audit row %s committed but protected audit-chain anchor could not be updated", entry_id)
         except Exception as e:
+            try:
+                if outer_transaction:
+                    c.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                    c.execute(f"RELEASE SAVEPOINT {savepoint}")
+                else:
+                    self.conn.rollback()
+            except Exception:
+                self.conn.rollback()
             logging.error(f"Failed to write audit log: {e}")
 
-    def get_audit_log(self, limit: int = 50) -> list:
-        """Returns recent audit log entries."""
+    def _audit_entry_hash(self, entry_id, timestamp, username, action, details, previous_hash):
+        payload = json.dumps(
+            [entry_id, timestamp or "", username or "", action or "", details or "", previous_hash or ""],
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        if not self._integrity_key:
+            raise RuntimeError("Audit integrity key is unavailable")
+        return AUDIT_HASH_PREFIX + hmac.new(self._integrity_key, payload, hashlib.sha256).hexdigest()
+
+    def _initialize_audit_chain(self):
+        """Backfill pre-feature audit rows once, preserving order as the baseline."""
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT id, timestamp, username, action, details, previous_hash, entry_hash, hash_version FROM audit_log ORDER BY id")
+        rows = cursor.fetchall()
+        current_version = AUDIT_HASH_VERSION
+        # Once any keyed row exists, never silently re-baseline the chain. A
+        # damaged or removed keyed hash must remain visible to the verifier.
+        has_keyed_rows = any(isinstance(row[6], str) and row[6].startswith(AUDIT_HASH_PREFIX) for row in rows)
+        if has_keyed_rows:
+            for entry_id, _ts, _user, _action, _details, _previous, entry_hash, version in rows:
+                if isinstance(entry_hash, str) and entry_hash.startswith(AUDIT_HASH_PREFIX) and version != current_version:
+                    cursor.execute("UPDATE audit_log SET hash_version=? WHERE id=?", (current_version, entry_id))
+            self.conn.commit()
+            return
+        previous_hash = ""
+        for index, (entry_id, timestamp, username, action, details, stored_previous, _entry_hash, _version) in enumerate(rows):
+            # Preserve the first row's old anchor if retention had already
+            # removed the earlier part of the chain.
+            if index == 0:
+                stored_previous = stored_previous or ""
+            else:
+                stored_previous = previous_hash
+            computed_hash = self._audit_entry_hash(
+                entry_id, timestamp, username, action, details, stored_previous
+            )
+            cursor.execute(
+                "UPDATE audit_log SET previous_hash=?, entry_hash=?, hash_version=? WHERE id=?",
+                (stored_previous, computed_hash, current_version, entry_id),
+            )
+            previous_hash = computed_hash
+        self.conn.commit()
+
+    def _initialize_audit_head_anchor(self):
+        """Initialize a missing OS-protected tail anchor from the current chain."""
+        if KeyManager.retrieve_audit_head(self._audit_anchor_account) is not None:
+            return
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT id, entry_hash FROM audit_log ORDER BY id DESC LIMIT 1")
+        row = cursor.fetchone()
+        if row and row[1]:
+            if not KeyManager.store_audit_head(f"{row[0]}:{row[1]}", self._audit_anchor_account):
+                logging.error("Could not initialize the protected audit-chain anchor")
+
+    def verify_audit_integrity(self) -> dict:
+        """Verify entry contents and links; the first retained row is an anchor."""
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT id, timestamp, username, action, details, previous_hash, entry_hash, hash_version FROM audit_log ORDER BY id")
+        rows = cursor.fetchall()
+        if not rows:
+            anchor = KeyManager.retrieve_audit_head(self._audit_anchor_account)
+            reason = "tail_anchor_mismatch" if anchor else "empty_log"
+            return {"valid": False, "count": 0, "entry_id": None, "reason": reason}
+        previous_entry_hash = None
+        truncated_prefix = bool(rows and rows[0][5])
+        for entry_id, timestamp, username, action, details, previous_hash, entry_hash, hash_version in rows:
+            previous_hash = previous_hash or ""
+            if hash_version != AUDIT_HASH_VERSION or not isinstance(entry_hash, str) or not entry_hash.startswith(AUDIT_HASH_PREFIX):
+                return {"valid": False, "count": len(rows), "entry_id": entry_id, "reason": "unsupported_hash_version"}
+            try:
+                expected = self._audit_entry_hash(
+                    entry_id, timestamp, username, action, details, previous_hash
+                )
+            except (TypeError, ValueError):
+                return {"valid": False, "count": len(rows), "entry_id": entry_id, "reason": "invalid_record_data"}
+            if previous_entry_hash is not None and previous_hash != previous_entry_hash:
+                return {"valid": False, "count": len(rows), "entry_id": entry_id, "reason": "chain_link"}
+            if not entry_hash or not hmac.compare_digest(entry_hash, expected):
+                return {"valid": False, "count": len(rows), "entry_id": entry_id, "reason": "entry_hash"}
+            previous_entry_hash = entry_hash
+        protected_head = KeyManager.retrieve_audit_head(self._audit_anchor_account)
+        actual_head = f"{rows[-1][0]}:{rows[-1][6]}"
+        if protected_head and not hmac.compare_digest(protected_head, actual_head):
+            return {"valid": False, "count": len(rows), "entry_id": rows[-1][0], "reason": "tail_anchor_mismatch"}
+        return {"valid": True, "count": len(rows), "truncated_prefix": truncated_prefix}
+
+    def refresh_audit_head_anchor_after_restore(self) -> bool:
+        """Re-pin the restored database's current tail after an explicit restore."""
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT id, entry_hash FROM audit_log ORDER BY id DESC LIMIT 1")
+        row = cursor.fetchone()
+        if not row or not row[1]:
+            return False
+        return KeyManager.store_audit_head(f"{row[0]}:{row[1]}", self._audit_anchor_account)
+
+    def get_audit_log(self, limit: int = 50, search: str = "", username: str = "", action: str = "") -> list:
+        """Returns recent audit entries with optional parameterized filters."""
         c = self.conn.cursor()
-        c.execute("SELECT timestamp, username, action, details FROM audit_log ORDER BY timestamp DESC LIMIT ?", (limit,))
+        filters = []
+        params = []
+        if username.strip():
+            filters.append("username LIKE ? ESCAPE '\\'")
+            params.append("%" + username.strip().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%")
+        if action:
+            filters.append("action=?")
+            params.append(action)
+        if search.strip():
+            escaped = search.strip().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            filters.append("(timestamp LIKE ? ESCAPE '\\' OR username LIKE ? ESCAPE '\\' OR action LIKE ? ESCAPE '\\' OR details LIKE ? ESCAPE '\\')")
+            params.extend([f"%{escaped}%"] * 4)
+        where = " WHERE " + " AND ".join(filters) if filters else ""
+        params.append(max(1, min(int(limit), 10000)))
+        c.execute(
+            f"SELECT timestamp, username, action, details FROM audit_log{where} ORDER BY timestamp DESC, id DESC LIMIT ?",
+            params,
+        )
         return c.fetchall()
 
+    def get_audit_actions(self) -> list:
+        """Returns available audit action names for filtering."""
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT DISTINCT action FROM audit_log WHERE action IS NOT NULL ORDER BY action")
+        return [row[0] for row in cursor.fetchall()]
+
     # --- DOCUMENT FINGERPRINTS ---
-    
+
     def save_fingerprint(self, scan_id: int, document_name: str, fingerprint: int):
         """Store a document fingerprint."""
         c = self.conn.cursor()
@@ -627,10 +1279,18 @@ class SecureDatabase:
                   (scan_id, document_name, fingerprint))
         self.conn.commit()
 
-    def get_fingerprints(self) -> list:
-        """Returns all stored fingerprints as list of (scan_id, document_name, fingerprint)."""
+    def get_fingerprints(self, department: str = None) -> list:
+        """Return stored fingerprints, optionally limited to one department."""
         c = self.conn.cursor()
-        c.execute("SELECT scan_id, document_name, fingerprint FROM document_fingerprints")
+        if department:
+            c.execute(
+                """SELECT f.scan_id, f.document_name, f.fingerprint
+                   FROM document_fingerprints f JOIN scan_history s ON s.id=f.scan_id
+                   WHERE s.department=?""",
+                (department,),
+            )
+        else:
+            c.execute("SELECT scan_id, document_name, fingerprint FROM document_fingerprints")
         return c.fetchall()
 
     def get_last_scan_id(self) -> int:
@@ -641,7 +1301,7 @@ class SecureDatabase:
         return row[0] if row and row[0] else 0
 
     # --- PII CLUSTERS ---
-    
+
     def save_cluster(self, scan_id: int, reason: str, multiplier: float, entity_types: str):
         c = self.conn.cursor()
         c.execute("INSERT INTO pii_clusters (scan_id, cluster_reason, risk_multiplier, entity_types) VALUES (?, ?, ?, ?)",
@@ -654,112 +1314,248 @@ class SecureDatabase:
         return c.fetchall()
 
     # --- COMPLIANCE POLICIES & VIOLATIONS ---
-    
+
     def save_compliance_policy(self, name: str, desc: str, conditions_json: str, severity: str, remediation: str, created_by: str):
         c = self.conn.cursor()
-        c.execute('''INSERT INTO compliance_policies 
-                     (name, description_ar, conditions_json, severity, remediation_ar, created_by) 
-                     VALUES (?, ?, ?, ?, ?, ?)''', 
+        c.execute('''INSERT INTO compliance_policies
+                     (name, description_ar, conditions_json, severity, remediation_ar, created_by)
+                     VALUES (?, ?, ?, ?, ?, ?)''',
                   (name, desc, conditions_json, severity, remediation, created_by))
         self.conn.commit()
-        
+
     def get_active_policies(self) -> list:
         c = self.conn.cursor()
         c.execute("SELECT id, name, description_ar, conditions_json, severity, remediation_ar FROM compliance_policies WHERE is_active=1")
         return c.fetchall()
-        
+
     def log_policy_violation(self, policy_id: int, scan_id: int, document_name: str, details: str):
         c = self.conn.cursor()
-        c.execute('''INSERT INTO policy_violations 
-                     (policy_id, scan_id, document_name, violation_details) 
-                     VALUES (?, ?, ?, ?)''', 
+        c.execute('''INSERT INTO policy_violations
+                     (policy_id, scan_id, document_name, violation_details)
+                     VALUES (?, ?, ?, ?)''',
                   (policy_id, scan_id, document_name, details))
         self.conn.commit()
-        
+
     def get_open_violations(self) -> list:
         c = self.conn.cursor()
         c.execute('''SELECT v.id, p.name, p.severity, v.document_name, v.violation_details, v.created_at, v.scan_id
-                     FROM policy_violations v 
-                     JOIN compliance_policies p ON v.policy_id = p.id 
+                     FROM policy_violations v
+                     JOIN compliance_policies p ON v.policy_id = p.id
                      WHERE v.status='OPEN' ORDER BY v.created_at DESC''')
         return c.fetchall()
-        
+
     def resolve_violation(self, violation_id: int, resolved_by: str):
         c = self.conn.cursor()
-        c.execute('''UPDATE policy_violations 
-                     SET status='RESOLVED', resolved_by=?, resolved_at=CURRENT_TIMESTAMP 
+        c.execute('''UPDATE policy_violations
+                     SET status='RESOLVED', resolved_by=?, resolved_at=CURRENT_TIMESTAMP
                      WHERE id=?''', (resolved_by, violation_id))
         self.conn.commit()
-        
+
     # --- INCIDENT MANAGEMENT ---
-    
+
     def create_incident(self, title: str, description: str, severity: str, source_type: str, source_id: int, created_by: str) -> int:
         c = self.conn.cursor()
-        
+
         # Calculate SLA based on severity
         sla_hours = {"CRITICAL": 4, "HIGH": 24, "MEDIUM": 72, "LOW": 168}.get(severity, 24)
-        c.execute('''INSERT INTO incidents 
-                     (title, description, severity, source_type, source_id, created_by, sla_deadline) 
-                     VALUES (?, ?, ?, ?, ?, ?, datetime('now', '+' || ? || ' hours'))''', 
+        c.execute('''INSERT INTO incidents
+                     (title, description, severity, source_type, source_id, created_by, sla_deadline)
+                     VALUES (?, ?, ?, ?, ?, ?, datetime('now', '+' || ? || ' hours'))''',
                   (title, description, severity, source_type, source_id, created_by, sla_hours))
         self.conn.commit()
         return c.lastrowid
-        
+
     def get_incidents(self) -> list:
         c = self.conn.cursor()
-        c.execute('''SELECT id, title, description, severity, status, assigned_to, 
-                            source_type, sla_deadline, created_at 
+        c.execute('''SELECT id, title, description, severity, status, assigned_to,
+                            source_type, sla_deadline, created_at
                      FROM incidents ORDER BY created_at DESC''')
         return c.fetchall()
-        
+
     def update_incident_status(self, incident_id: int, status: str, assigned_to: str = None, resolution_notes: str = None):
         c = self.conn.cursor()
         updates = ["status=?"]
         params = [status]
-        
+
         if assigned_to:
             updates.append("assigned_to=?")
             params.append(assigned_to)
-            
+
         if status == 'CLOSED':
             updates.append("resolved_at=CURRENT_TIMESTAMP")
             if resolution_notes:
                 updates.append("resolution_notes=?")
                 params.append(resolution_notes)
-                
+
         c.execute(f"UPDATE incidents SET {','.join(updates)} WHERE id=?", (*params, incident_id))
         self.conn.commit()
 
     # --- SCHEDULED TASKS ---
-    
-    def save_scheduled_task(self, name: str, directory_path: str, cron_expression: str, scan_strategy: str, created_by: str):
+
+    def save_scheduled_task(self, name: str, directory_path: str, cron_expression: str, scan_strategy: str, created_by: str, department: str = None):
         c = self.conn.cursor()
-        c.execute('''INSERT INTO scheduled_tasks 
-                     (name, directory_path, cron_expression, scan_strategy, created_by) 
-                     VALUES (?, ?, ?, ?, ?)''', 
-                  (name, directory_path, cron_expression, scan_strategy, created_by))
+        c.execute('''INSERT INTO scheduled_tasks
+                     (name, directory_path, cron_expression, scan_strategy, created_by, department)
+                     VALUES (?, ?, ?, ?, ?, ?)''',
+                  (name, directory_path, cron_expression, scan_strategy, created_by, department))
+        task_id = c.lastrowid
         self.conn.commit()
-        
+        self.log_audit(
+            created_by or "system",
+            "SCHEDULED_TASK_CREATED",
+            f"Scheduled task {task_id} created for department {department or 'general'}.",
+        )
+        return task_id
+
     def get_scheduled_tasks(self) -> list:
         c = self.conn.cursor()
-        c.execute('''SELECT id, name, directory_path, cron_expression, scan_strategy, 
-                            is_enabled, last_run, last_run_files_count, last_run_violations 
+        c.execute('''SELECT id, name, directory_path, cron_expression, scan_strategy,
+                            is_enabled, last_run, last_run_files_count, last_run_violations, created_at, department, run_started_at, run_owner_pid, last_run_status, last_run_error_count
                      FROM scheduled_tasks ORDER BY created_at DESC''')
         return c.fetchall()
-        
-    def update_task_last_run(self, task_id: int, files_count: int, violations: int):
+
+    def update_task_last_run(self, task_id: int, files_count: int, violations: int, status: str = "SUCCESS", error_count: int = 0):
         c = self.conn.cursor()
-        c.execute('''UPDATE scheduled_tasks 
-                     SET last_run=CURRENT_TIMESTAMP, last_run_files_count=?, last_run_violations=? 
-                     WHERE id=?''', (files_count, violations, task_id))
+        c.execute('''UPDATE scheduled_tasks
+                     SET last_run=CURRENT_TIMESTAMP, last_run_files_count=?, last_run_violations=?,
+                         run_started_at=NULL, run_owner_pid=NULL, last_run_status=?, last_run_error_count=?
+                     WHERE id=?''', (files_count, violations, status, error_count, task_id))
         self.conn.commit()
-        
-    def get_scan_manifest(self, task_id: int) -> dict:
-        """Returns dict mapping file_path to last_modified timestamp string."""
+
+    def mark_scheduled_task_started(self, task_id: int, owner_pid: int = None) -> bool:
+        """Atomically claim an enabled task so it cannot be deleted mid-run."""
         c = self.conn.cursor()
-        c.execute("SELECT file_path, last_modified FROM scan_manifest WHERE task_id=?", (task_id,))
-        return {row[0]: row[1] for row in c.fetchall()}
-        
+        c.execute(
+            "UPDATE scheduled_tasks SET run_started_at=CURRENT_TIMESTAMP, run_owner_pid=?, last_run_status='RUNNING' "
+            "WHERE id=? AND is_enabled=1 AND run_started_at IS NULL",
+            (owner_pid or os.getpid(), task_id),
+        )
+        started = c.rowcount > 0
+        self.conn.commit()
+        return started
+
+    def clear_scheduled_task_run(self, task_id: int):
+        c = self.conn.cursor()
+        c.execute("UPDATE scheduled_tasks SET run_started_at=NULL, run_owner_pid=NULL WHERE id=?", (task_id,))
+        self.conn.commit()
+
+    def recover_interrupted_scheduled_tasks(self) -> int:
+        """Clear task claims whose owning process is no longer running."""
+        c = self.conn.cursor()
+        c.execute("SELECT id, run_owner_pid FROM scheduled_tasks WHERE run_started_at IS NOT NULL")
+        interrupted = [task_id for task_id, owner_pid in c.fetchall() if not self._process_is_running(owner_pid)]
+        if interrupted:
+            c.executemany(
+                "UPDATE scheduled_tasks SET run_started_at=NULL, run_owner_pid=NULL, last_run_status='INTERRUPTED' "
+                "WHERE id=? AND run_started_at IS NOT NULL",
+                [(task_id,) for task_id in interrupted],
+            )
+            self.conn.commit()
+        return len(interrupted)
+
+    @staticmethod
+    def _process_is_running(pid) -> bool:
+        if not pid:
+            return False
+        try:
+            os.kill(int(pid), 0)
+            return True
+        except PermissionError:
+            return True
+        except ProcessLookupError:
+            return False
+        except (OSError, ValueError, TypeError) as exc:
+            if getattr(exc, "winerror", None) == 87 or getattr(exc, "errno", None) == 3:
+                return False
+            return True
+
+    def set_scheduled_task_enabled(self, task_id: int, enabled: bool, updated_by: str = "system") -> bool:
+        c = self.conn.cursor()
+        c.execute("UPDATE scheduled_tasks SET is_enabled=? WHERE id=?", (int(bool(enabled)), task_id))
+        changed = c.rowcount > 0
+        self.conn.commit()
+        if changed:
+            self.log_audit(
+                updated_by or "system",
+                "SCHEDULED_TASK_ENABLED" if enabled else "SCHEDULED_TASK_DISABLED",
+                f"Scheduled task {task_id} {'enabled' if enabled else 'disabled'}.",
+            )
+        return changed
+
+    def update_scheduled_task(
+        self, task_id: int, name: str, directory_path: str, cron_expression: str,
+        scan_strategy: str, department: str = None, updated_by: str = "system",
+    ) -> bool:
+        name = (name or "").strip()
+        directory_path = os.path.abspath((directory_path or "").strip())
+        cron_expression = (cron_expression or "").strip()
+        scan_strategy = (scan_strategy or "").strip()
+        if not name or not os.path.isdir(directory_path):
+            raise ValueError("اسم المهمة أو مجلدها غير صالح.")
+        if scan_strategy not in {"legal_mask", "full_mask", "partial_mask", "pseudonymize"}:
+            raise ValueError("استراتيجية التحليل غير مدعومة.")
+        from croniter import croniter
+        if not croniter.is_valid(cron_expression):
+            raise ValueError("تعبير الجدولة غير صالح.")
+        if department:
+            c = self.conn.cursor()
+            c.execute("SELECT 1 FROM departments WHERE name=?", (department,))
+            if not c.fetchone():
+                raise ValueError("القسم المحدد لم يعد موجودًا.")
+
+        c = self.conn.cursor()
+        c.execute(
+            """UPDATE scheduled_tasks
+               SET name=?, directory_path=?, cron_expression=?, scan_strategy=?, department=?
+               WHERE id=? AND run_started_at IS NULL""",
+            (name, directory_path, cron_expression, scan_strategy, department, task_id),
+        )
+        changed = c.rowcount > 0
+        self.conn.commit()
+        if not changed:
+            c.execute("SELECT 1 FROM scheduled_tasks WHERE id=?", (task_id,))
+            if c.fetchone():
+                raise ValueError("لا يمكن تعديل مهمة أثناء تشغيلها.")
+            return False
+        self.log_audit(
+            updated_by or "system",
+            "SCHEDULED_TASK_UPDATED",
+            f"Scheduled task {task_id} updated ({name}); department={department or 'general'}.",
+        )
+        return True
+
+    def delete_scheduled_task(self, task_id: int, deleted_by: str = "system") -> bool:
+        c = self.conn.cursor()
+        c.execute("BEGIN IMMEDIATE")
+        try:
+            c.execute("SELECT name, run_started_at, run_owner_pid FROM scheduled_tasks WHERE id=?", (task_id,))
+            task = c.fetchone()
+            if not task:
+                self.conn.rollback()
+                return False
+            if task[1] and self._process_is_running(task[2]):
+                self.conn.rollback()
+                raise ValueError("لا يمكن حذف مهمة أثناء تشغيلها.")
+            c.execute("DELETE FROM scan_manifest WHERE task_id=?", (task_id,))
+            c.execute("DELETE FROM scheduled_tasks WHERE id=?", (task_id,))
+            self.conn.commit()
+        except Exception:
+            if self.conn.in_transaction:
+                self.conn.rollback()
+            raise
+        self.log_audit(
+            deleted_by or "system",
+            "SCHEDULED_TASK_DELETED",
+            f"Scheduled task {task_id} deleted ({task[0]}).",
+        )
+        return True
+
+    def get_scan_manifest(self, task_id: int) -> dict:
+        """Returns file_path to (SHA-256 digest, last-modified timestamp)."""
+        c = self.conn.cursor()
+        c.execute("SELECT file_path, file_hash, last_modified FROM scan_manifest WHERE task_id=?", (task_id,))
+        return {row[0]: (row[1], row[2]) for row in c.fetchall()}
+
     def update_scan_manifest(self, task_id: int, file_path: str, file_hash: str, last_modified: str):
         c = self.conn.cursor()
         # Insert or replace
@@ -768,38 +1564,72 @@ class SecureDatabase:
         if row:
             c.execute("UPDATE scan_manifest SET file_hash=?, last_modified=?, last_scanned=CURRENT_TIMESTAMP WHERE id=?", (file_hash, last_modified, row[0]))
         else:
-            c.execute("INSERT INTO scan_manifest (task_id, file_path, file_hash, last_modified, last_scanned) VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)", 
+            c.execute("INSERT INTO scan_manifest (task_id, file_path, file_hash, last_modified, last_scanned) VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)",
                       (task_id, file_path, file_hash, last_modified))
         self.conn.commit()
 
     # --- RETENTION POLICIES ---
-    
+
     def run_retention_purge(self):
         """Purges old records according to retention_policies table."""
         c = self.conn.cursor()
         c.execute("SELECT table_name, retention_days, action FROM retention_policies WHERE is_active=1")
         policies = c.fetchall()
-        
+
+        date_columns = {
+            'scan_history': 'timestamp',
+            'audit_log': 'timestamp',
+            'policy_violations': 'created_at',
+            'incidents': 'created_at',
+        }
         for table, days, action in policies:
             # Only allow specific tables to prevent SQL injection
             allowed_tables = ['scan_history', 'audit_log', 'policy_violations', 'incidents']
-            if table not in allowed_tables:
+            if table not in allowed_tables or action != 'DELETE' or int(days) < 1:
                 continue
-                
+
+            cutoff = f'-{int(days)} days'
+            c.execute("SAVEPOINT retention_table")
             try:
-                # Use strftime and date logic for sqlite
-                query = f"DELETE FROM {table} WHERE created_at < datetime('now', '-{days} days')"
-                c.execute(query)
+                # Remove dependent rows first so enabled foreign keys do not
+                # silently prevent retention from deleting eligible records.
+                if table == "scan_history":
+                    old_scans = "SELECT id FROM scan_history WHERE timestamp < datetime('now', ?)"
+                    for child_table in (
+                        "policy_violations", "document_fingerprints", "pii_clusters",
+                        "incident_evidence", "entity_index", "anomaly_log",
+                    ):
+                        c.execute(f"DELETE FROM {child_table} WHERE scan_id IN ({old_scans})", (cutoff,))
+                elif table == "incidents":
+                    old_incidents = "SELECT id FROM incidents WHERE created_at < datetime('now', ?)"
+                    c.execute(f"DELETE FROM incident_notes WHERE incident_id IN ({old_incidents})", (cutoff,))
+                    c.execute(f"DELETE FROM incident_evidence WHERE incident_id IN ({old_incidents})", (cutoff,))
+
+                query = f"DELETE FROM {table} WHERE {date_columns[table]} < datetime('now', ?)"
+                c.execute(query, (cutoff,))
                 deleted_count = c.rowcount
                 if deleted_count > 0:
                     c.execute("INSERT INTO retention_log (table_name, records_deleted) VALUES (?, ?)", (table, deleted_count))
+                c.execute("RELEASE SAVEPOINT retention_table")
+                self.conn.commit()
+                if deleted_count > 0:
+                    self.log_audit("system", "RETENTION_PURGE", f"Retention policy deleted {deleted_count} records from {table} older than {int(days)} days.")
             except Exception as e:
+                try:
+                    c.execute("ROLLBACK TO SAVEPOINT retention_table")
+                    c.execute("RELEASE SAVEPOINT retention_table")
+                    self.conn.commit()
+                except Exception:
+                    self.conn.rollback()
                 import logging
                 logging.error(f"Retention purge failed for {table}: {e}")
-                
+
         self.conn.commit()
-        
+
     def save_retention_policy(self, table_name: str, days: int, action: str = 'DELETE'):
+        allowed_tables = {'scan_history', 'audit_log', 'policy_violations', 'incidents'}
+        if table_name not in allowed_tables or int(days) < 1 or action != 'DELETE':
+            raise ValueError("Unsupported retention policy")
         c = self.conn.cursor()
         # Upsert
         c.execute("SELECT id FROM retention_policies WHERE table_name=?", (table_name,))
@@ -808,20 +1638,45 @@ class SecureDatabase:
         else:
             c.execute("INSERT INTO retention_policies (table_name, retention_days, action) VALUES (?, ?, ?)", (table_name, days, action))
         self.conn.commit()
-        
+
     def get_retention_policies(self) -> dict:
         c = self.conn.cursor()
         c.execute("SELECT table_name, retention_days FROM retention_policies WHERE is_active=1")
         return {row[0]: row[1] for row in c.fetchall()}
 
+    def count_retention_candidates(self, table_name: str, days: int) -> int:
+        """Count records matching a retention cutoff without changing data."""
+        date_columns = {
+            "scan_history": "timestamp",
+            "audit_log": "timestamp",
+            "policy_violations": "created_at",
+            "incidents": "created_at",
+        }
+        if table_name not in date_columns or int(days) < 1:
+            raise ValueError("Unsupported retention preview request")
+        cursor = self.conn.cursor()
+        cursor.execute(
+            f"SELECT COUNT(*) FROM {table_name} WHERE {date_columns[table_name]} < datetime('now', ?)",
+            (f"-{int(days)} days",),
+        )
+        return int(cursor.fetchone()[0])
+
+    def get_retention_log(self, limit: int = 100) -> list:
+        cursor = self.conn.cursor()
+        cursor.execute(
+            "SELECT table_name, records_deleted, execution_time FROM retention_log ORDER BY id DESC LIMIT ?",
+            (max(1, min(int(limit), 1000)),),
+        )
+        return cursor.fetchall()
+
     # --- ANONYMIZATION TEMPLATES ---
-    
+
     def save_template(self, name: str, strategy: str, preset: str, nlp_enabled: bool):
         c = self.conn.cursor()
-        c.execute("INSERT OR REPLACE INTO anonymization_templates (name, strategy, preset, nlp_enabled) VALUES (?, ?, ?, ?)", 
+        c.execute("INSERT OR REPLACE INTO anonymization_templates (name, strategy, preset, nlp_enabled) VALUES (?, ?, ?, ?)",
                   (name, strategy, preset, nlp_enabled))
         self.conn.commit()
-        
+
     def get_templates(self) -> list:
         c = self.conn.cursor()
         c.execute("SELECT id, name, strategy, preset, nlp_enabled FROM anonymization_templates")
@@ -838,12 +1693,12 @@ class SecureDatabase:
             enc_text = self._encrypt_val(ent.text)
             # Create a deterministic hash for cross-linking (use raw text, lowercased to group case variants)
             ent_hash = hashlib.sha256(ent.text.lower().encode('utf-8')).hexdigest()
-            
+
             context_label = getattr(ent, 'context_label', 'GENERAL')
             context_keywords = getattr(ent, 'context_keywords', '')
-            
-            c.execute('''INSERT INTO entity_index 
-                         (entity_type, entity_text, entity_hash, document_name, scan_id, department, context_label, context_keywords) 
+
+            c.execute('''INSERT INTO entity_index
+                         (entity_type, entity_text, entity_hash, document_name, scan_id, department, context_label, context_keywords)
                          VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
                       (ent.entity_type, enc_text, ent_hash, document_name, scan_id, department, context_label, context_keywords))
         self.conn.commit()
@@ -852,10 +1707,10 @@ class SecureDatabase:
         """Find entities that appear in multiple different documents."""
         c = self.conn.cursor()
         # Find hashes that appear in > 1 distinct document
-        c.execute('''SELECT entity_hash, entity_type, COUNT(DISTINCT document_name) as doc_count 
-                     FROM entity_index 
-                     GROUP BY entity_hash 
-                     HAVING doc_count > 1 
+        c.execute('''SELECT entity_hash, entity_type, COUNT(DISTINCT document_name) as doc_count
+                     FROM entity_index
+                     GROUP BY entity_hash
+                     HAVING doc_count > 1
                      ORDER BY doc_count DESC LIMIT 100''')
         results = []
         for row in c.fetchall():
@@ -891,10 +1746,27 @@ class SecureDatabase:
 
     def get_user_departments(self, user_id: int) -> list:
         c = self.conn.cursor()
-        c.execute('''SELECT d.name FROM departments d 
-                     JOIN user_departments ud ON d.id = ud.department_id 
+        c.execute('''SELECT d.name FROM departments d
+                     JOIN user_departments ud ON d.id = ud.department_id
                      WHERE ud.user_id=?''', (user_id,))
         return [r[0] for r in c.fetchall()]
+
+    def set_user_department(self, username: str, department_id: Optional[int]) -> bool:
+        """Assign one department to a user, replacing any prior assignments."""
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT id FROM users WHERE username=?", (username,))
+        user = cursor.fetchone()
+        if not user:
+            return False
+        if department_id is not None:
+            cursor.execute("SELECT 1 FROM departments WHERE id=?", (department_id,))
+            if not cursor.fetchone():
+                return False
+        cursor.execute("DELETE FROM user_departments WHERE user_id=?", (user[0],))
+        if department_id is not None:
+            cursor.execute("INSERT INTO user_departments (user_id, department_id) VALUES (?, ?)", (user[0], department_id))
+        self.conn.commit()
+        return True
 
     # --- Feature #4: DSAR Manager ---
     def create_dsar_request(self, requester: str, contact: str, subject: str, req_type: str = 'ACCESS') -> int:
@@ -902,8 +1774,8 @@ class SecureDatabase:
         enc_subject = self._encrypt_val(subject)
         enc_requester = self._encrypt_val(requester)
         enc_contact = self._encrypt_val(contact)
-        c.execute('''INSERT INTO dsar_requests 
-                     (requester_name, requester_contact, subject_identity, request_type, sla_deadline) 
+        c.execute('''INSERT INTO dsar_requests
+                     (requester_name, requester_contact, subject_identity, request_type, sla_deadline)
                      VALUES (?, ?, ?, ?, datetime('now', '+30 days'))''',
                   (enc_requester, enc_contact, enc_subject, req_type))
         self.conn.commit()
@@ -927,18 +1799,18 @@ class SecureDatabase:
     def update_dsar_status(self, req_id: int, status: str, resolution_notes: str = ""):
         c = self.conn.cursor()
         if status == 'CLOSED':
-            c.execute("UPDATE dsar_requests SET status=?, resolution_notes=?, resolved_at=CURRENT_TIMESTAMP WHERE id=?", 
+            c.execute("UPDATE dsar_requests SET status=?, resolution_notes=?, resolved_at=CURRENT_TIMESTAMP WHERE id=?",
                       (status, resolution_notes, req_id))
         else:
-            c.execute("UPDATE dsar_requests SET status=?, resolution_notes=? WHERE id=?", 
+            c.execute("UPDATE dsar_requests SET status=?, resolution_notes=? WHERE id=?",
                       (status, resolution_notes, req_id))
         self.conn.commit()
 
     # --- Feature #19: Anomaly Detection ---
     def log_anomaly(self, anomaly_type: str, desc: str, severity: str, scan_id: int, z_score: float, mean: float, obs: float):
         c = self.conn.cursor()
-        c.execute('''INSERT INTO anomaly_log 
-                     (anomaly_type, description, severity, scan_id, z_score, baseline_mean, observed_value) 
+        c.execute('''INSERT INTO anomaly_log
+                     (anomaly_type, description, severity, scan_id, z_score, baseline_mean, observed_value)
                      VALUES (?, ?, ?, ?, ?, ?, ?)''',
                   (anomaly_type, desc, severity, scan_id, z_score, mean, obs))
         self.conn.commit()
@@ -962,8 +1834,8 @@ class SecureDatabase:
                 ("تسريب هويات متعددة (Bulk Identity Leak)", "اكتشاف أرقام تعريف وطنية متعددة في ملف واحد، مما يدل على قاعدة بيانات عملاء.", '["NIN"]', "HIGH", "التحقق من صلاحية وصول المستخدم وحذف الملف إذا لم يكن ضرورياً.", "Alg-PII Threat Feed", "2024-03-20"),
                 ("بيانات دفع غير مشفرة (Unencrypted Payment Data)", "اكتشاف أرقام RIB أو CCP مكشوفة.", '["RIB", "CCP"]', "CRITICAL", "تشفير الملف فوراً أو إخفاء الأرقام.", "Alg-PII Threat Feed", "2024-03-20"),
             ]
-            c.executemany('''INSERT INTO threat_intelligence 
-                             (threat_name, description_ar, indicators_json, severity, remediation_ar, source, last_updated) 
+            c.executemany('''INSERT INTO threat_intelligence
+                             (threat_name, description_ar, indicators_json, severity, remediation_ar, source, last_updated)
                              VALUES (?, ?, ?, ?, ?, ?, ?)''', threats)
             self.conn.commit()
 
@@ -1004,7 +1876,7 @@ class SecureDatabase:
 
     def save_training_result(self, username: str, quiz_ids: str, score: float, passed: bool):
         c = self.conn.cursor()
-        c.execute("INSERT INTO training_results (username, quiz_ids, score, passed) VALUES (?, ?, ?, ?)", 
+        c.execute("INSERT INTO training_results (username, quiz_ids, score, passed) VALUES (?, ?, ?, ?)",
                   (username, quiz_ids, score, passed))
         self.conn.commit()
 
@@ -1019,52 +1891,92 @@ class SecureDatabase:
     # --- Feature #28: Document Transfers ---
     def create_transfer(self, source_dept: int, target_dept: int, orig_scan: int, anon_scan: int, strategy: str, reason: str, sender: str, receiver: str):
         c = self.conn.cursor()
-        c.execute('''INSERT INTO document_transfers 
-                     (source_department_id, target_department_id, original_scan_id, anonymized_scan_id, strategy_used, transfer_reason, sender, receiver) 
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
-                  (source_dept, target_dept, orig_scan, anon_scan, strategy, reason, sender, receiver))
+        if source_dept is None or target_dept is None or source_dept == target_dept:
+            raise ValueError("يجب تحديد قسمين مختلفين لطلب النقل.")
+        if not reason or not reason.strip():
+            raise ValueError("سبب النقل مطلوب.")
+        if not strategy or strategy.strip().casefold() not in {"legal mask", "full mask", "legal_mask", "full_mask"}:
+            raise ValueError("استراتيجية التعتيم المحددة غير مدعومة.")
+        for department_id in (source_dept, target_dept):
+            c.execute("SELECT 1 FROM departments WHERE id=?", (department_id,))
+            if not c.fetchone():
+                raise ValueError("أحد القسمين المحددين غير موجود.")
+        for scan_id in (orig_scan, anon_scan):
+            if scan_id is None:
+                continue
+            c.execute("SELECT 1 FROM scan_history WHERE id=?", (scan_id,))
+            if not c.fetchone():
+                raise ValueError(f"معرف الفحص {scan_id} غير موجود.")
+        c.execute(
+            '''INSERT INTO document_transfers
+               (source_department_id, target_department_id, original_scan_id, anonymized_scan_id,
+                strategy_used, transfer_reason, sender, receiver)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
+            (source_dept, target_dept, orig_scan, anon_scan, strategy.strip(), reason.strip(), sender, receiver),
+        )
+        transfer_id = c.lastrowid
+        c.execute("SELECT name FROM departments WHERE id=?", (source_dept,))
+        source_name = c.fetchone()[0]
+        c.execute("SELECT name FROM departments WHERE id=?", (target_dept,))
+        target_name = c.fetchone()[0]
         self.conn.commit()
-        return c.lastrowid
+        self.log_audit(
+            sender or "system",
+            "TRANSFER_REQUEST_CREATED",
+            f"Request {transfer_id}: {source_name} -> {target_name}; scan={orig_scan}; requested_strategy={strategy.strip()}.",
+        )
+        return transfer_id
 
     def get_transfers(self, department_id: int = None) -> list:
         c = self.conn.cursor()
         if department_id:
-            c.execute('''SELECT t.id, d1.name, d2.name, t.original_scan_id, t.anonymized_scan_id, t.strategy_used, 
-                                t.transfer_reason, t.sender, t.receiver, t.status, t.created_at 
+            c.execute('''SELECT t.id, d1.name, d2.name, t.original_scan_id, t.anonymized_scan_id, t.strategy_used,
+                                t.transfer_reason, t.sender, t.receiver, t.status, t.created_at
                          FROM document_transfers t
                          LEFT JOIN departments d1 ON t.source_department_id = d1.id
                          LEFT JOIN departments d2 ON t.target_department_id = d2.id
-                         WHERE t.source_department_id=? OR t.target_department_id=? ORDER BY t.created_at DESC''', 
+                         WHERE t.source_department_id=? OR t.target_department_id=? ORDER BY t.created_at DESC''',
                       (department_id, department_id))
         else:
-            c.execute('''SELECT t.id, d1.name, d2.name, t.original_scan_id, t.anonymized_scan_id, t.strategy_used, 
-                                t.transfer_reason, t.sender, t.receiver, t.status, t.created_at 
+            c.execute('''SELECT t.id, d1.name, d2.name, t.original_scan_id, t.anonymized_scan_id, t.strategy_used,
+                                t.transfer_reason, t.sender, t.receiver, t.status, t.created_at
                          FROM document_transfers t
                          LEFT JOIN departments d1 ON t.source_department_id = d1.id
                          LEFT JOIN departments d2 ON t.target_department_id = d2.id
                          ORDER BY t.created_at DESC''')
         return c.fetchall()
 
-    def update_transfer_status(self, transfer_id: int, status: str):
+    def update_transfer_status(self, transfer_id: int, status: str, updated_by: str = "system"):
+        status = (status or "").strip().upper()
+        if status not in {"APPROVED", "REJECTED"}:
+            raise ValueError("حالة طلب النقل غير صالحة.")
         c = self.conn.cursor()
-        c.execute("UPDATE document_transfers SET status=? WHERE id=?", (status, transfer_id))
+        c.execute("UPDATE document_transfers SET status=? WHERE id=? AND status='PENDING'", (status, transfer_id))
         self.conn.commit()
+        if c.rowcount == 0:
+            raise ValueError("الطلب غير موجود أو تمت معالجته مسبقًا.")
+        self.log_audit(
+            updated_by or "system",
+            "TRANSFER_REQUEST_DECIDED",
+            f"Request {transfer_id} decision recorded: {status}.",
+        )
 
     # --- Feature #18: Data Flow Mapping ---
     def get_data_flow_stats(self) -> dict:
         c = self.conn.cursor()
         # Source to target transfers
-        c.execute('''SELECT d1.name, d2.name, COUNT(*) 
+        c.execute('''SELECT d1.name, d2.name, t.status, COUNT(*)
                      FROM document_transfers t
                      JOIN departments d1 ON t.source_department_id = d1.id
                      JOIN departments d2 ON t.target_department_id = d2.id
-                     GROUP BY d1.name, d2.name''')
+                     GROUP BY d1.name, d2.name, t.status
+                     ORDER BY d1.name, d2.name, t.status''')
         transfers = c.fetchall()
-        
+
         # Scans per department
         c.execute("SELECT department, COUNT(*) FROM scan_history WHERE department IS NOT NULL GROUP BY department")
         scans = c.fetchall()
-        
+
         return {"transfers": transfers, "scans": scans}
 
     # --- Feature #17: Report Templates ---
@@ -1072,7 +1984,7 @@ class SecureDatabase:
         c = self.conn.cursor()
         if is_default:
             c.execute("UPDATE report_templates SET is_default=0")
-        c.execute('''INSERT INTO report_templates (name, description, template_json, logo_path, is_default, created_by) 
+        c.execute('''INSERT INTO report_templates (name, description, template_json, logo_path, is_default, created_by)
                      VALUES (?, ?, ?, ?, ?, ?)''', (name, desc, template_json, logo_path, is_default, created_by))
         self.conn.commit()
 
@@ -1094,18 +2006,18 @@ class SecureDatabase:
             end_date = f"{year+1}-01-01"
         else:
             end_date = f"{year}-{month+1:02d}-01"
-            
+
         deadlines = []
-        
+
         # DSAR SLAs
         c.execute("SELECT requester_name, sla_deadline, status FROM dsar_requests WHERE sla_deadline >= ? AND sla_deadline < ?", (start_date, end_date))
         for r in c.fetchall():
             req_name = self._decrypt_val(r[0]) if r[0] else ""
             deadlines.append({"title": f"DSAR Request: {req_name}", "date": r[1], "status": r[2], "type": "DSAR"})
-            
+
         # Incident SLAs
         c.execute("SELECT 'Incident: ' || title, sla_deadline, status FROM incidents WHERE sla_deadline >= ? AND sla_deadline < ?", (start_date, end_date))
         for r in c.fetchall():
             deadlines.append({"title": r[0], "date": r[1], "status": r[2], "type": "Incident"})
-            
+
         return deadlines
